@@ -530,17 +530,13 @@ final class AudioPlayerManager {
     private func activateSessionIfNeeded() {
         guard !isAudioSessionActive else { return }
         isAudioSessionActive = true
-        Task.detached(priority: .userInitiated) {
-            try? AVAudioSession.sharedInstance().setActive(true)
-        }
+        AVAudioSession.sharedInstance().activate(options: []) { _, _ in }
     }
 
     private func deactivateSession() {
         guard isAudioSessionActive else { return }
         isAudioSessionActive = false
-        Task.detached(priority: .utility) {
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        }
+        AVAudioSession.sharedInstance().deactivate(options: [.notifyOthersOnDeactivation]) { _, _ in }
     }
 
     // MARK: Regras do Automix vs Gapless

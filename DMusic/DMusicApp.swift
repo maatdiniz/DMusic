@@ -2,6 +2,10 @@ import SwiftUI
 
 @main
 struct DMusicApp: App {
+    init() {
+        AppLogger.shared.start()
+    }
+
     @State private var auth = AppServices.shared.auth
     @State private var player = AppServices.shared.player
     @State private var downloads = AppServices.shared.downloads
