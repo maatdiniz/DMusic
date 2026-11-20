@@ -1,0 +1,28 @@
+import SwiftUI
+
+@main
+struct DMusicApp: App {
+    @State private var auth = AppServices.shared.auth
+    @State private var player = AppServices.shared.player
+    @State private var downloads = AppServices.shared.downloads
+    @State private var recents = AppServices.shared.recents
+    @State private var cacheSettings = AppServices.shared.cacheSettings
+    @State private var scrobbler = AppServices.shared.scrobbler
+    @State private var favorites = AppServices.shared.favorites
+    @State private var analysisStore = AppServices.shared.analysisStore
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(auth)
+                .environment(player)
+                .environment(downloads)
+                .environment(recents)
+                .environment(cacheSettings)
+                .environment(scrobbler)
+                .environment(favorites)
+                .environment(analysisStore)
+                .tint(Color(red: 0.04, green: 0.52, blue: 1.0))
+        }
+    }
+}

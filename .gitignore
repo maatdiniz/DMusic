@@ -1,0 +1,19 @@
+# macOS / Xcode
+.DS_Store
+*.xcuserdatad
+xcuserdata/
+DerivedData/
+*.xcscmblueprint
+*.xccheckout
+
+# Python / Analyzer local artifacts & personal library data
+mix-analyzer/.venv/
+mix-analyzer/__pycache__/
+# Logs
+*.log
+mix-analyzer/scan.log
+mix-analyzer/itunes_tracks/
+mix-analyzer/analisar_biblioteca.command
+
+# Local notes with environment-specific info
+CONTEXTO_APP.md

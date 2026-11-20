@@ -1,0 +1,593 @@
+import SwiftUI
+
+enum DarkSheetTheme {
+    static let background = Color(red: 0.055, green: 0.058, blue: 0.068)
+    static let cardFill = Color.white.opacity(0.06)
+    static let cardStroke = Color.white.opacity(0.08)
+    static let divider = Color.white.opacity(0.07)
+    static let headerText = Color.white.opacity(0.48)
+    static let footerText = Color.white.opacity(0.46)
+    static let secondaryText = Color.white.opacity(0.58)
+}
+
+struct DarkSheetHeader: View {
+    let title: String
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack {
+            Text(title)
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
+            Spacer()
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                    .frame(width: 30, height: 30)
+                    .background(Color.white.opacity(0.10), in: Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+    }
+}
+
+struct DarkCardSection<Content: View>: View {
+    let header: String?
+    let footer: String?
+    @ViewBuilder let content: () -> Content
+
+    init(_ header: String? = nil, footer: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+        self.header = header
+        self.footer = footer
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let header, !header.isEmpty {
+                Text(header.uppercased())
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.8)
+                    .foregroundStyle(DarkSheetTheme.headerText)
+                    .padding(.horizontal, 4)
+            }
+            VStack(spacing: 0) {
+                content()
+            }
+            .background(DarkSheetTheme.cardFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(DarkSheetTheme.cardStroke, lineWidth: 0.7)
+            )
+            if let footer, !footer.isEmpty {
+                Text(footer)
+                    .font(.caption)
+                    .foregroundStyle(DarkSheetTheme.footerText)
+                    .padding(.horizontal, 4)
+            }
+        }
+    }
+}
+
+struct DarkCardDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(DarkSheetTheme.divider)
+            .frame(height: 0.5)
+            .padding(.leading, 14)
+    }
+}
+
+struct DarkLabeledRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.white)
+            Spacer()
+            Text(value)
+                .font(.subheadline)
+                .foregroundStyle(DarkSheetTheme.secondaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+}
+
+struct DarkToggleRow: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Toggle(title, isOn: $isOn)
+            .font(.subheadline)
+            .foregroundStyle(.white)
+            .tint(Color(red: 0.12, green: 0.88, blue: 0.42))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+    }
+}
+
+struct DarkMenuPickerRow<SelectionValue: Hashable>: View {
+    let title: String
+    @Binding var selection: SelectionValue
+    let valueLabel: String
+    let options: [(value: SelectionValue, label: String)]
+
+    var body: some View {
+        HStack {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.white)
+            Spacer()
+            Menu {
+                ForEach(options, id: \.value) { opt in
+                    Button {
+                        selection = opt.value
+                    } label: {
+                        if opt.value == selection {
+                            Label(opt.label, systemImage: "checkmark")
+                        } else {
+                            Text(opt.label)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(valueLabel)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(DarkSheetTheme.secondaryText)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.38))
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+}
+
+struct DarkNavRow<Destination: View>: View {
+    let title: String
+    var icon: String? = nil
+    var value: String? = nil
+    @ViewBuilder let destination: () -> Destination
+
+    var body: some View {
+        NavigationLink(destination: destination) {
+            HStack(spacing: 10) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.78))
+                        .frame(width: 20)
+                }
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                Spacer()
+                if let value, !value.isEmpty {
+                    Text(value)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(DarkSheetTheme.secondaryText)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.32))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct SettingsView: View {
+    @Environment(CacheSettings.self) private var settings
+    @Environment(RecentSongsCache.self) private var recents
+    @Environment(DownloadManager.self) private var downloads
+    @Environment(AudioPlayerManager.self) private var player
+    @Environment(AuthViewModel.self) private var auth
+    @Environment(ScrobbleManager.self) private var scrobbler
+    @Environment(TrackAnalysisStore.self) private var analysisStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var coverUsage: Int64 = 0
+
+    var body: some View {
+        @Bindable var settings = settings
+        @Bindable var player = player
+        NavigationStack {
+            VStack(spacing: 0) {
+                DarkSheetHeader(title: "Ajustes") { dismiss() }
+
+                ScrollView {
+                    VStack(spacing: 18) {
+                        DarkCardSection(
+                            "Reprodução",
+                            footer: "O Automix analisa BPM, tonalidade Camelot (1A–12B) e 1º beat das faixas locais (\(analysisStore.items.count) analisadas), sincronizando o ritmo na entrada da próxima música e voltando suavemente à velocidade original. Álbuns ouvidos em ordem mantêm Gapless puro."
+                        ) {
+                            DarkMenuPickerRow(
+                                title: "Wi‑Fi",
+                                selection: $settings.wifiBitrate,
+                                valueLabel: CacheSettings.bitrateLabel(settings.wifiBitrate),
+                                options: CacheSettings.bitrateOptions.map { ($0, CacheSettings.bitrateLabel($0)) }
+                            )
+                            DarkCardDivider()
+                            DarkMenuPickerRow(
+                                title: "Dados móveis",
+                                selection: $settings.cellularBitrate,
+                                valueLabel: CacheSettings.bitrateLabel(settings.cellularBitrate),
+                                options: CacheSettings.bitrateOptions.map { ($0, CacheSettings.bitrateLabel($0)) }
+                            )
+                            DarkCardDivider()
+                            DarkToggleRow(title: "Automix (BPM + Tom Camelot)", isOn: $player.automixEnabled)
+                            DarkCardDivider()
+                            DarkToggleRow(title: "Retomar de onde parou", isOn: $settings.resumePlayback)
+                        }
+
+                        DarkCardSection(
+                            "Compensação de Volume",
+                            footer: settings.volumeCompensation.note
+                        ) {
+                            DarkMenuPickerRow(
+                                title: "Nivelamento",
+                                selection: $settings.volumeCompensation,
+                                valueLabel: settings.volumeCompensation.title,
+                                options: VolumeCompensationLevel.allCases.map { ($0, $0.title) }
+                            )
+                        }
+                        .onChange(of: settings.volumeCompensation) { _, newValue in
+                            player.applyVolumeCompensation(newValue)
+                        }
+
+                        DarkCardSection(
+                            "Cache de capas",
+                            footer: "Sem limite de tamanho. Capas de músicas baixadas são sempre mantidas."
+                        ) {
+                            DarkLabeledRow(title: "Em uso", value: formatBytes(coverUsage))
+                            DarkCardDivider()
+                            actionRow("Limpar cache de capas", destructive: true) {
+                                Task { await ImageCache.shared.clear(); await refresh() }
+                            }
+                        }
+
+                        DarkCardSection(
+                            "Músicas tocadas recentemente",
+                            footer: "Guarda no aparelho o arquivo das faixas ouvidas, para tocar sem rede. As menos recentes saem primeiro. Downloads manuais não são afetados."
+                        ) {
+                            DarkMenuPickerRow(
+                                title: "Limite",
+                                selection: $settings.recentLimitMB,
+                                valueLabel: CacheSettings.label(settings.recentLimitMB),
+                                options: CacheSettings.recentOptionsMB.map { ($0, CacheSettings.label($0)) }
+                            )
+                            DarkCardDivider()
+                            DarkToggleRow(title: "Salvar só no Wi‑Fi", isOn: $settings.cacheOnlyWifi)
+                            DarkCardDivider()
+                            DarkLabeledRow(title: "Em uso", value: formatBytes(recents.usedBytes))
+                            DarkCardDivider()
+                            DarkLabeledRow(title: "Músicas", value: "\(recents.entries.count)")
+                            DarkCardDivider()
+                            actionRow("Limpar músicas recentes", destructive: true) {
+                                recents.clear(protecting: playingIds)
+                            }
+                        }
+
+                        DarkCardSection("Integração") {
+                            DarkNavRow(
+                                title: "Last.fm e Scrobbles",
+                                value: scrobbler.pending.isEmpty ? nil : "\(scrobbler.pending.count) na fila"
+                            ) {
+                                LastFMView()
+                            }
+                        }
+
+                        DarkCardSection(
+                            "Servidor de Mixagem (allin1)",
+                            footer: "Calcula estrutura musical (intro, verso, refrão, outro), BPM, downbeats e tonalidade Camelot no servidor e entrega o roteiro de transição ao app."
+                        ) {
+                            if let health = analysisStore.serverHealth {
+                                DarkLabeledRow(
+                                    title: "Status",
+                                    value: health.scanning ? "Analisando (\(health.analyzed)/\(health.totalNavidrome))" : "Online (\(health.analyzed)/\(health.totalNavidrome))"
+                                )
+                                DarkCardDivider()
+                                DarkLabeledRow(title: "Analisador", value: health.analyzer)
+                            } else {
+                                DarkLabeledRow(title: "Status", value: "Offline / Não conectado")
+                            }
+                            if let mc = player.mixClient {
+                                DarkCardDivider()
+                                DarkLabeledRow(title: "Endereço", value: mc.baseURL)
+                                DarkCardDivider()
+                                Button {
+                                    Task { await analysisStore.syncFromServer(mixClient: mc) }
+                                } label: {
+                                    HStack {
+                                        Text("Sincronizar tags (BPM / Camelot)")
+                                            .font(.subheadline)
+                                            .foregroundStyle(.white)
+                                        Spacer()
+                                        if analysisStore.isSyncingServer {
+                                            ProgressView().controlSize(.small)
+                                        }
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 12)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(analysisStore.isSyncingServer)
+                                DarkCardDivider()
+                                actionRow("Reescanear biblioteca no servidor") {
+                                    Task {
+                                        try? await mc.triggerScan()
+                                        await analysisStore.refreshHealth(mixClient: mc)
+                                    }
+                                }
+                            }
+                            DarkCardDivider()
+                            DarkNavRow(
+                                title: "Logs de Mixagem e Ordem do Aleatório",
+                                value: "\(player.eventLogs.count)"
+                            ) {
+                                AutomixLogsView()
+                            }
+                            DarkCardDivider()
+                            DarkNavRow(
+                                title: "Guia de Cores e Mixagens",
+                                icon: "book.pages"
+                            ) {
+                                AutomixGuideView()
+                            }
+                        }
+
+                        DarkCardSection("Downloads") {
+                            DarkLabeledRow(title: "Faixas baixadas", value: "\(downloads.songs.count)")
+                        }
+
+                        DarkCardSection("Conta") {
+                            DarkLabeledRow(title: "Servidor", value: auth.serverURL)
+                            DarkCardDivider()
+                            DarkLabeledRow(title: "Usuário", value: auth.username)
+                            DarkCardDivider()
+                            actionRow("Sair", destructive: true) {
+                                dismiss()
+                                auth.logout()
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                    .padding(.bottom, 28)
+                }
+            }
+            .background(DarkSheetTheme.background.ignoresSafeArea())
+            .toolbar(.hidden, for: .navigationBar)
+            .task { await refresh() }
+            .onChange(of: settings.recentLimitMB) { _, _ in recents.trim(protecting: playingIds) }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func actionRow(_ title: String, destructive: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(destructive ? Color(red: 1.0, green: 0.36, blue: 0.38) : .white)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var playingIds: Set<String> { player.currentSong.map { [$0.id] } ?? [] }
+    private func refresh() async { coverUsage = await ImageCache.shared.usage() }
+}
+
+/// Tela de Logs do Automix & Explicação da Ordem do Aleatório Inteligente (`SmartShuffler`)
+struct AutomixLogsView: View {
+    @Environment(AudioPlayerManager.self) private var player
+    @Environment(TrackAnalysisStore.self) private var analysisStore
+    @State private var selectedTab = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Visualização", selection: $selectedTab) {
+                Text("Ordem do Aleatório").tag(0)
+                Text("Log Geral (\(player.eventLogs.count))").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+
+            if selectedTab == 0 {
+                smartShuffleReportView
+            } else {
+                generalEventLogView
+            }
+        }
+        .navigationTitle("Logs do Automix")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Limpar", role: .destructive) {
+                    player.clearLogs()
+                }
+                .disabled(player.eventLogs.isEmpty && player.lastSmartShuffleLog == nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var smartShuffleReportView: some View {
+        let report: SmartShuffleRunLog? = player.lastSmartShuffleLog ?? (
+            player.queue.count > 1
+                ? SmartShuffler.buildShuffleReport(orderedSongs: player.queue, metadata: analysisStore.items)
+                : nil
+        )
+
+        if let report {
+            List {
+                Section {
+                    LabeledContent("Faixas na fila", value: "\(report.totalTracks)")
+                    LabeledContent("Analisadas com IA (allin1)", value: "\(report.aiAnalyzedCount)")
+                    LabeledContent("Analisadas localmente", value: "\(report.localAnalyzedCount)")
+                    LabeledContent("Sem análise", value: "\(report.unanalyzedCount)")
+                    LabeledContent("Transições com Beatmatch", value: "\(report.beatmatchPairs) / \(max(report.steps.count, 0))")
+                    LabeledContent("Pior encaixe na fila", value: "\(Int(report.minScore.rounded())) / 100 pts")
+                    LabeledContent("Compatibilidade média", value: "\(Int(report.averageScore.rounded())) / 100 pts")
+                } header: {
+                    Text("Resumo da Fila Atual")
+                } footer: {
+                    Text("Pontuação de cada encaixe: BPM (até 50 pts, ±15% com Dual-Deck) + Tom Camelot (até 35 pts na Roda de Camelot) + Energia RMS (até 15 pts).")
+                }
+
+                Section {
+                    ForEach(report.steps) { step in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text("#\(step.position)")
+                                    .font(.caption.monospacedDigit().weight(.black))
+                                    .foregroundStyle(.secondary)
+                                Text(step.toTitle)
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                if step.sourceTag != "IA allin1" {
+                                    Text(step.sourceTag)
+                                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                                        .foregroundStyle(step.sourceTag == "Local" ? .orange : .secondary)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1.5)
+                                        .background(Color.white.opacity(0.08), in: Capsule())
+                                }
+                                Spacer()
+                                scorePill(score: step.totalScore)
+                            }
+
+                            if !step.toArtist.isEmpty {
+                                Text("Após \"\(step.fromTitle)\" • \(step.toArtist)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            } else {
+                                Text("Após \"\(step.fromTitle)\"")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+
+                            HStack(spacing: 8) {
+                                Label(
+                                    "\(Int(step.bpmFrom.rounded()))→\(Int(step.bpmTo.rounded())) (+\(Int(step.bpmPoints.rounded())))",
+                                    systemImage: "metronome"
+                                )
+                                Label(
+                                    "\(step.camelotFrom)→\(step.camelotTo) (+\(Int(step.camelotPoints.rounded())))",
+                                    systemImage: "music.quarternote.3"
+                                )
+                                if let vibeSim = step.vibeSimilarity {
+                                    Label(
+                                        "V:\(Int((vibeSim * 100).rounded()))% (+\(Int(step.vibePoints.rounded())))",
+                                        systemImage: "sparkles"
+                                    )
+                                } else {
+                                    Label(
+                                        "E:\(Int((step.energyTo * 100).rounded()))% (+\(Int(step.energyPoints.rounded())))",
+                                        systemImage: "bolt.fill"
+                                    )
+                                }
+                            }
+                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 3)
+                    }
+                } header: {
+                    Text("Como a Ordem Foi Escolhida (Passo a Passo)")
+                }
+            }
+        } else {
+            ContentUnavailableView(
+                "Nenhuma Fila Aleatória Ativa",
+                systemImage: "shuffle",
+                description: Text("Inicie uma playlist ou lista de músicas no modo Aleatório com o Automix ligado para ver a pontuação detalhada de BPM, Tom Camelot e Energia de cada faixa.")
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var generalEventLogView: some View {
+        if player.eventLogs.isEmpty {
+            ContentUnavailableView(
+                "Sem Eventos Registrados Ainda",
+                systemImage: "waveform.path.ecg",
+                description: Text("Conforme o Automix prepara transições, sincroniza o BPM e aplica EQ/Filtros, cada ação aparece aqui em tempo real.")
+            )
+        } else {
+            List(player.eventLogs) { item in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        categoryBadge(item.category)
+                        Text(item.title)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(2)
+                        Spacer()
+                        Text(item.timestamp.formatted(date: .omitted, time: .standard))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(item.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func scorePill(score: Double) -> some View {
+        let pts = Int(score.rounded())
+        let color: Color = pts >= 75
+            ? Color(red: 0.12, green: 0.84, blue: 0.38)
+            : (pts >= 45 ? Color(red: 1.0, green: 0.65, blue: 0.12) : Color.secondary)
+        return Text("\(pts) pts")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15), in: Capsule())
+    }
+
+    private func categoryBadge(_ cat: AutomixEventLog.Category) -> some View {
+        let color: Color
+        switch cat {
+        case .shuffle: color = Color(red: 0.74, green: 0.38, blue: 1.0)
+        case .sync:    color = Color(red: 1.0, green: 0.62, blue: 0.12)
+        case .mix:     color = Color(red: 0.12, green: 0.86, blue: 0.40)
+        case .server:  color = Color(red: 0.25, green: 0.78, blue: 1.0)
+        case .engine:  color = Color.gray
+        }
+        return Text(cat.rawValue)
+            .font(.system(size: 9, weight: .black, design: .rounded))
+            .foregroundStyle(.black)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color, in: Capsule())
+    }
+}
