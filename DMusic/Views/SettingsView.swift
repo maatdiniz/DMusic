@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 enum DarkSheetTheme {
     static let background = Color(red: 0.055, green: 0.058, blue: 0.068)
@@ -339,8 +340,8 @@ struct SettingsView: View {
                             }
                             DarkCardDivider()
                             DarkNavRow(
-                                title: "Logs de Mixagem e Ordem do Aleatório",
-                                value: "\(player.eventLogs.count)"
+                                title: "Log Completo e Ordem do Aleatório",
+                                icon: "doc.text.magnifyingglass"
                             ) {
                                 AutomixLogsView()
                             }
@@ -404,13 +405,13 @@ struct SettingsView: View {
 struct AutomixLogsView: View {
     @Environment(AudioPlayerManager.self) private var player
     @Environment(TrackAnalysisStore.self) private var analysisStore
-    @State private var selectedTab = 0
+    @State private var selectedTab = 1
 
     var body: some View {
         VStack(spacing: 0) {
             Picker("Visualização", selection: $selectedTab) {
+                Text("Log Completo").tag(1)
                 Text("Ordem do Aleatório").tag(0)
-                Text("Log Geral (\(player.eventLogs.count))").tag(1)
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 16)
@@ -419,17 +420,25 @@ struct AutomixLogsView: View {
             if selectedTab == 0 {
                 smartShuffleReportView
             } else {
-                generalEventLogView
+                LiveConsoleLogView()
             }
         }
-        .navigationTitle("Logs do Automix")
+        .navigationTitle("Log Completo")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button("Limpar", role: .destructive) {
-                    player.clearLogs()
+                if selectedTab == 1 {
+                    Button(role: .destructive) {
+                        AppLogger.shared.clearLog()
+                    } label: {
+                        Label("Limpar", systemImage: "trash")
+                    }
+                } else {
+                    Button("Limpar", role: .destructive) {
+                        player.clearLogs()
+                    }
+                    .disabled(player.eventLogs.isEmpty && player.lastSmartShuffleLog == nil)
                 }
-                .disabled(player.eventLogs.isEmpty && player.lastSmartShuffleLog == nil)
             }
         }
     }
@@ -531,36 +540,6 @@ struct AutomixLogsView: View {
         }
     }
 
-    @ViewBuilder
-    private var generalEventLogView: some View {
-        if player.eventLogs.isEmpty {
-            ContentUnavailableView(
-                "Sem Eventos Registrados Ainda",
-                systemImage: "waveform.path.ecg",
-                description: Text("Conforme o Automix prepara transições, sincroniza o BPM e aplica EQ/Filtros, cada ação aparece aqui em tempo real.")
-            )
-        } else {
-            List(player.eventLogs) { item in
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        categoryBadge(item.category)
-                        Text(item.title)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(2)
-                        Spacer()
-                        Text(item.timestamp.formatted(date: .omitted, time: .standard))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(item.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 2)
-            }
-        }
-    }
-
     private func scorePill(score: Double) -> some View {
         let pts = Int(score.rounded())
         let color: Color = pts >= 75
@@ -573,21 +552,83 @@ struct AutomixLogsView: View {
             .padding(.vertical, 2)
             .background(color.opacity(0.15), in: Capsule())
     }
+}
 
-    private func categoryBadge(_ cat: AutomixEventLog.Category) -> some View {
-        let color: Color
-        switch cat {
-        case .shuffle: color = Color(red: 0.74, green: 0.38, blue: 1.0)
-        case .sync:    color = Color(red: 1.0, green: 0.62, blue: 0.12)
-        case .mix:     color = Color(red: 0.12, green: 0.86, blue: 0.40)
-        case .server:  color = Color(red: 0.25, green: 0.78, blue: 1.0)
-        case .engine:  color = Color.gray
+/// Exibição bruta do console em tempo real: texto monoespaçado, sem firulas, com cópia e auto-scroll.
+private struct LiveConsoleLogView: View {
+    @State private var logText: String = ""
+    @State private var autoScroll: Bool = true
+    private let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("\(lineCount) linhas")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    autoScroll.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: autoScroll ? "arrow.down.circle.fill" : "arrow.down.circle")
+                        Text(autoScroll ? "Auto-rolar" : "Pausado")
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(autoScroll ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    UIPasteboard.general.string = logText
+                } label: {
+                    Label("Copiar", systemImage: "doc.on.doc")
+                        .font(.caption2.weight(.medium))
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.mini)
+                .disabled(logText.isEmpty)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color(uiColor: .secondarySystemBackground))
+
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(logText.isEmpty ? "Aguardando logs do sistema..." : logText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color(red: 0.88, green: 0.90, blue: 0.92))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .textSelection(.enabled)
+                        .id("bottom_anchor")
+                }
+                .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+                .onChange(of: logText) { _, _ in
+                    if autoScroll {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("bottom_anchor", anchor: .bottom)
+                        }
+                    }
+                }
+            }
         }
-        return Text(cat.rawValue)
-            .font(.system(size: 9, weight: .black, design: .rounded))
-            .foregroundStyle(.black)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color, in: Capsule())
+        .onAppear { reload() }
+        .onReceive(timer) { _ in reload() }
+        .onReceive(NotificationCenter.default.publisher(for: AppLogger.logUpdatedNotification)) { _ in reload() }
+    }
+
+    private var lineCount: Int {
+        logText.isEmpty ? 0 : logText.split(whereSeparator: \.isNewline).count
+    }
+
+    private func reload() {
+        let text = AppLogger.shared.readLog()
+        if text != logText {
+            logText = text
+        }
     }
 }

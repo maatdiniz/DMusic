@@ -7,9 +7,12 @@ import Foundation
 final class AppLogger: @unchecked Sendable {
     static let shared = AppLogger()
     static let logFilename = "console.log"
+    static let logUpdatedNotification = Notification.Name("AppLoggerDidUpdateNotification")
 
     private var isStarted = false
     private let logQueue = DispatchQueue(label: "app.dmusic.logger", qos: .utility)
+    private var logURL: URL?
+    private var lastNotificationTime: TimeInterval = 0
 
     private init() {}
 
@@ -18,19 +21,20 @@ final class AppLogger: @unchecked Sendable {
         isStarted = true
 
         guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-        let logURL = docs.appendingPathComponent(Self.logFilename)
+        let url = docs.appendingPathComponent(Self.logFilename)
+        self.logURL = url
 
         // Limita o tamanho do arquivo a 5MB para economizar espaço de armazenamento
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
            let size = attrs[.size] as? Int64, size > 5 * 1024 * 1024 {
-            try? FileManager.default.removeItem(at: logURL)
+            try? FileManager.default.removeItem(at: url)
         }
 
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
         }
 
-        guard let fileHandle = try? FileHandle(forWritingTo: logURL) else { return }
+        guard let fileHandle = try? FileHandle(forWritingTo: url) else { return }
         fileHandle.seekToEndOfFile()
 
         let origStderr = dup(STDERR_FILENO)
@@ -52,7 +56,7 @@ final class AppLogger: @unchecked Sendable {
             fileHandle.write(hData)
         }
 
-        logQueue.async {
+        logQueue.async { [weak self] in
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
                 let bytesRead = read(readFD, &buffer, buffer.count)
@@ -68,7 +72,39 @@ final class AppLogger: @unchecked Sendable {
                 // 2. Grava no arquivo no disco
                 let data = Data(buffer[0..<bytesRead])
                 fileHandle.write(data)
+
+                // 3. Notifica a UI em tempo real (com throttle suave de 300ms)
+                let now = Date().timeIntervalSince1970
+                if let self, now - self.lastNotificationTime > 0.3 {
+                    self.lastNotificationTime = now
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: AppLogger.logUpdatedNotification, object: nil)
+                    }
+                }
             }
+        }
+    }
+
+    /// Lê o log completo em texto bruto (retorna até os últimos 200KB para fluidez de rolagem)
+    func readLog() -> String {
+        guard let url = logURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent(Self.logFilename),
+              let data = try? Data(contentsOf: url) else {
+            return ""
+        }
+        let maxBytes = 200 * 1024
+        let slice = data.count > maxBytes ? data.suffix(maxBytes) : data
+        return String(decoding: slice, as: UTF8.self)
+    }
+
+    /// Limpa o arquivo de log do console
+    func clearLog() {
+        guard let url = logURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent(Self.logFilename) else { return }
+        let formatter = ISO8601DateFormatter()
+        let timestamp = formatter.string(from: Date())
+        let header = "=== DMusic Log Reiniciado: \(timestamp) ===\n"
+        try? header.write(to: url, atomically: true, encoding: .utf8)
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: AppLogger.logUpdatedNotification, object: nil)
         }
     }
 }

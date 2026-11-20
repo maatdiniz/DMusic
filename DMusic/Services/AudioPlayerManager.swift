@@ -128,11 +128,13 @@ final class AudioPlayerManager {
         if eventLogs.count > 250 {
             eventLogs.removeLast(eventLogs.count - 250)
         }
+        print("[\(category.rawValue.uppercased())] \(title) — \(detail)")
     }
 
     func clearLogs() {
         eventLogs.removeAll()
         lastSmartShuffleLog = nil
+        AppLogger.shared.clearLog()
     }
 
     // MARK: Preferências do DJ Automix (Duração, Curva de Volume, EQ, Filtros e Reverb)
