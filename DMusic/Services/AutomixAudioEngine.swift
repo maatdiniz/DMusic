@@ -423,7 +423,9 @@ final class AutomixAudioEngine {
         let savedFileB = hasStartedIncoming ? nil : incomingDeck.file
         let savedSongIdB = hasStartedIncoming ? nil : incomingSongId
 
-        try? AVAudioSession.sharedInstance().setActive(true)
+        Task.detached(priority: .userInitiated) {
+            try? AVAudioSession.sharedInstance().setActive(true)
+        }
         seek(to: resumeTime)
 
         if let savedPlan, let savedFileB, let savedSongIdB {

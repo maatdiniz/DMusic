@@ -521,25 +521,26 @@ final class AudioPlayerManager {
     // MARK: Session
 
     private func configureSession() {
-        let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playback, mode: .default)
-        // Não ativa a sessão aqui para NÃO interromper outros apps ao abrir
+        Task.detached(priority: .userInitiated) {
+            let s = AVAudioSession.sharedInstance()
+            try? s.setCategory(.playback, mode: .default)
+        }
     }
 
     private func activateSessionIfNeeded() {
         guard !isAudioSessionActive else { return }
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-            isAudioSessionActive = true
-        } catch {
-            // Continua mesmo se o sistema já reportar ativação
+        isAudioSessionActive = true
+        Task.detached(priority: .userInitiated) {
+            try? AVAudioSession.sharedInstance().setActive(true)
         }
     }
 
     private func deactivateSession() {
         guard isAudioSessionActive else { return }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         isAudioSessionActive = false
+        Task.detached(priority: .utility) {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     // MARK: Regras do Automix vs Gapless
