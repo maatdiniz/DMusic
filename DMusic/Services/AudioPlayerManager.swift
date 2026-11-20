@@ -217,6 +217,7 @@ final class AudioPlayerManager {
     @ObservationIgnored private var itemIndex: [ObjectIdentifier: Int] = [:]
     @ObservationIgnored private var preloadedIndex: Int?
     @ObservationIgnored private var automixPrepareTask: Task<Void, Never>?
+    @ObservationIgnored private var isAudioSessionActive = false
     /// Quantas faixas logo após a atual foram colocadas por "Tocar a seguir" (têm prioridade mesmo no shuffle).
     private(set) var priorityCount = 0
 
@@ -491,11 +492,12 @@ final class AudioPlayerManager {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if type == .began {
+                    self.isAudioSessionActive = false
                     if self.usingEngineMode { self.automixEngine.pause() }
                     self.isPlaying = false
                     self.updateNowPlayingProgress()
                 } else if type == .ended, shouldResume {
-                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.activateSessionIfNeeded()
                     self.resume()
                 }
             }
@@ -521,7 +523,23 @@ final class AudioPlayerManager {
     private func configureSession() {
         let s = AVAudioSession.sharedInstance()
         try? s.setCategory(.playback, mode: .default)
-        try? s.setActive(true)
+        // Não ativa a sessão aqui para NÃO interromper outros apps ao abrir
+    }
+
+    private func activateSessionIfNeeded() {
+        guard !isAudioSessionActive else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            isAudioSessionActive = true
+        } catch {
+            // Continua mesmo se o sistema já reportar ativação
+        }
+    }
+
+    private func deactivateSession() {
+        guard isAudioSessionActive else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        isAudioSessionActive = false
     }
 
     // MARK: Regras do Automix vs Gapless
@@ -790,13 +808,16 @@ final class AudioPlayerManager {
         itemIndex = [:]
         activeItem = nil
 
+        if autoplay {
+            activateSessionIfNeeded()
+        }
+
         if shouldUseAutomix,
            let localURL = localFileURL(for: song.id),
            let audioFile = try? AVAudioFile(forReading: localURL),
            AutomixAudioEngine.canPlay(file: audioFile) {
             usingEngineMode = true
             automixEngine.volumeCompensation = settings?.volumeCompensation ?? .off
-            try? AVAudioSession.sharedInstance().setActive(true)
             automixEngine.startPlaying(file: audioFile, songId: song.id, startAtSec: 0, autoplay: autoplay)
             isPlaying = autoplay
         } else {
@@ -806,7 +827,6 @@ final class AudioPlayerManager {
             activeItem = item
             applyGaplessVolumeForCurrentSong()
             gaplessPlayer.insert(item, after: nil)
-            try? AVAudioSession.sharedInstance().setActive(true)
             if autoplay { gaplessPlayer.play() }
             isPlaying = autoplay
         }
@@ -1142,7 +1162,7 @@ final class AudioPlayerManager {
 
     func resume() {
         guard currentSong != nil else { return }
-        try? AVAudioSession.sharedInstance().setActive(true)
+        activateSessionIfNeeded()
         if usingEngineMode {
             automixEngine.resume()
         } else {
@@ -1413,6 +1433,7 @@ final class AudioPlayerManager {
         playbackSource = nil
         isPlaying = false
         showNowPlaying = false
+        deactivateSession()
         try? FileManager.default.removeItem(at: stateURL)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }

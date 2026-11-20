@@ -3,6 +3,7 @@ import Security
 
 nonisolated enum KeychainStore {
     private static let service = "app.dmusic.credentials"
+    private static let legacyService = "br.diniz.music.credentials"
 
     static func set(_ value: String, for key: String) {
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
@@ -15,7 +16,7 @@ nonisolated enum KeychainStore {
         SecItemAdd(add as CFDictionary, nil)
     }
 
-    static func get(_ key: String) -> String? {
+    private static func rawGet(_ key: String, service: String) -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service,
                                 kSecAttrAccount as String: key,
@@ -26,10 +27,21 @@ nonisolated enum KeychainStore {
         return String(data: d, encoding: .utf8)
     }
 
+    static func get(_ key: String) -> String? {
+        if let val = rawGet(key, service: service) { return val }
+        if let legacy = rawGet(key, service: legacyService) {
+            set(legacy, for: key) // Auto-migra para a nova chave
+            return legacy
+        }
+        return nil
+    }
+
     static func remove(_ key: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrService as String: service,
-                                kSecAttrAccount as String: key]
-        SecItemDelete(q as CFDictionary)
+        for s in [service, legacyService] {
+            let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: s,
+                                    kSecAttrAccount as String: key]
+            SecItemDelete(q as CFDictionary)
+        }
     }
 }
