@@ -1193,25 +1193,44 @@ final class AudioPlayerManager {
     }
 
     func seek(to seconds: Double) {
+        let existingPlan = activeTransitionPlan
         let clampedSeconds: Double
-        if shouldUseAutomix, let plan = activeTransitionPlan, plan.trackA.mixStartSec > 4.0 {
-            clampedSeconds = min(max(0.0, seconds), max(0.0, plan.trackA.mixStartSec - 0.15))
+        if shouldUseAutomix, let plan = existingPlan, plan.trackA.mixStartSec > 4.0 {
+            // Se o usuário arrastou até perto ou depois do ponto de mixagem, posiciona 3 s antes
+            // para ele assistir à rampa de BPM + transição completa sem perdê-la!
+            let previewLead = min(3.0, max(1.5, plan.trackA.mixStartSec * 0.15))
+            clampedSeconds = min(max(0.0, seconds), max(0.0, plan.trackA.mixStartSec - previewLead))
         } else {
             clampedSeconds = max(0.0, seconds)
         }
         currentTime = clampedSeconds
         if usingEngineMode {
-            preparedMixHint = nil
-            activeTransitionPlan = nil
             automixPhaseLabel = nil
-            automixBadge = nil
             resetDJStage()
             automixEngine.seek(to: clampedSeconds)
             if shouldUseAutomix, let cur = currentSong, let nextSong = nextSongInQueue {
-                automixPrepareTask?.cancel()
-                automixPrepareTask = Task {
-                    await prepareIncomingAutomix(from: cur, to: nextSong, protecting: [cur.id, nextSong.id])
+                // Reaproveita imediatamente o plano já armado em memória (0 ms de espera de rede)
+                if let plan = existingPlan,
+                   plan.trackA.id == cur.id,
+                   plan.trackB.id == nextSong.id,
+                   let localB = localFileURL(for: nextSong.id),
+                   let fileB = try? AVAudioFile(forReading: localB),
+                   AutomixAudioEngine.canPlay(file: fileB) {
+                    automixEngine.prepareIncoming(fileB: fileB, songId: nextSong.id, plan: plan)
+                    activeTransitionPlan = plan
+                } else {
+                    preparedMixHint = nil
+                    activeTransitionPlan = nil
+                    automixBadge = nil
+                    automixPrepareTask?.cancel()
+                    automixPrepareTask = Task {
+                        await prepareIncomingAutomix(from: cur, to: nextSong, protecting: [cur.id, nextSong.id])
+                    }
                 }
+            } else {
+                preparedMixHint = nil
+                activeTransitionPlan = nil
+                automixBadge = nil
             }
         } else {
             gaplessPlayer.seek(to: CMTime(seconds: clampedSeconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)

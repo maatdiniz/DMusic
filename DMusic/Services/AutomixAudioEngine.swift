@@ -746,22 +746,21 @@ final class AutomixAudioEngine {
         var effectivePlan = plan
         let now = currentTime(for: activeDeck)
         let durA = activeDeck.fileDuration
-        if durA > 0, now >= plan.trackA.mixStartSec - 0.5 {
+        if durA > 0, now >= plan.trackA.mixStartSec - 0.25 {
             let remaining = durA - now
-            guard remaining >= 4.0 else {
+            guard remaining >= 3.5 else {
                 clearPreparedIncoming()
                 return
             }
-            let fadeStart = max(now + 0.5, durA - min(7.0, remaining * 0.65))
-            let fadeEnd = max(fadeStart + 2.5, durA - 0.35)
-            effectivePlan.trackA.rampStartSec = fadeStart
+            // Mesmo se o usuário pulou para depois do mixStart, preserva o beatmatch (targetRateA/initialRateB)
+            // e dispara uma entrada rápida em ~1.2 s em vez de cancelar a sincronia de BPM!
+            let fadeStart = min(now + 1.2, max(now + 0.35, durA - min(6.0, remaining * 0.65)))
+            let fadeEnd = max(fadeStart + 2.5, min(durA - 0.25, fadeStart + max(4.0, plan.mix.durationSec * 0.5)))
+            effectivePlan.trackA.rampStartSec = now
             effectivePlan.trackA.mixStartSec = fadeStart
             effectivePlan.trackA.mixEndSec = fadeEnd
-            effectivePlan.sync.targetRateA = 1.0
-            effectivePlan.sync.initialRateB = 1.0
-            effectivePlan.sync.rampDurationSec = 0.0
+            effectivePlan.sync.rampDurationSec = max(0.3, (fadeStart - now) * 0.75)
             effectivePlan.mix.durationSec = fadeEnd - fadeStart
-            activeDeck.timePitch.rate = 1.0
             activeDeck.resetDSPToNeutral()
         }
 
@@ -805,6 +804,13 @@ final class AutomixAudioEngine {
                 if desiredRampStart > effectivePlan.trackA.rampStartSec {
                     effectivePlan.trackA.rampStartSec = desiredRampStart
                     effectivePlan.sync.rampDurationSec = fastRampSec
+                }
+                // Se o usuário já está dentro da janela da rampa (ex.: arrastou a barra para perto do mix),
+                // ajusta a rampa para começar imediatamente de `now` e completar antes da entrada do Deck B!
+                if now > effectivePlan.trackA.rampStartSec && now < effectivePlan.trackA.mixStartSec - 0.25 {
+                    let avail = effectivePlan.trackA.mixStartSec - now
+                    effectivePlan.trackA.rampStartSec = now
+                    effectivePlan.sync.rampDurationSec = max(0.35, min(fastRampSec, avail * 0.72))
                 }
             }
 
