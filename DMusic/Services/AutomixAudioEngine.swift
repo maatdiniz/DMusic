@@ -667,6 +667,200 @@ final class AutomixAudioEngine {
         return min(max(0.0, snappedSec), dur - 0.05)
     }
 
+    /// Mede o BPM real local (precisão de 0.1 BPM) diretamente no envelope de bumbos (< 170 Hz)
+    /// da janela de transição do arquivo decodificado. Usado em segundo plano antes de armar o mix
+    /// para corrigir desvios de arredondamento do `allin1` (ex.: 145.3 vs 148.3 BPM tratados como 1.000x).
+    nonisolated private static func measureLocalTrueBPM(
+        url: URL,
+        aroundSec: Double,
+        windowSec: Double = 24.0,
+        hintBPM: Double
+    ) -> (bpm: Double, confidence: Double)? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
+        let sr = file.processingFormat.sampleRate
+        let totalFrames = file.length
+        guard sr >= 8_000, totalFrames > Int64(sr * 8.0) else { return nil }
+        let dur = Double(totalFrames) / sr
+
+        let startSec = max(0.0, min(aroundSec, dur - windowSec))
+        let readDur = min(windowSec, dur - startSec)
+        guard readDur >= 8.0 else { return nil }
+
+        let startFrame = AVAudioFramePosition(startSec * sr)
+        let frameCount = AVAudioFrameCount(readDur * sr)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount) else { return nil }
+        file.framePosition = startFrame
+        do { try file.read(into: buf, frameCount: frameCount) } catch { return nil }
+
+        let n = Int(buf.frameLength)
+        guard n > Int(sr * 6.0), let chData = buf.floatChannelData else { return nil }
+        let chCount = Int(buf.format.channelCount)
+        var mono = [Float](repeating: 0, count: n)
+        if chCount == 1 {
+            memcpy(&mono, chData[0], n * MemoryLayout<Float>.size)
+        } else {
+            var scale: Float = 1.0 / Float(chCount)
+            for c in 0..<chCount {
+                vDSP_vsma(chData[c], 1, &scale, mono, 1, &mono, 1, vDSP_Length(n))
+            }
+        }
+
+        // Filtro passa-baixa ~170 Hz para isolar o pulso dos bumbos
+        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 170.0 / sr))
+        var low = [Float](repeating: 0, count: n)
+        var y: Float = 0
+        for i in 0..<n {
+            y += alpha * (mono[i] - y)
+            low[i] = y
+        }
+
+        let hopSec = 0.005 // 5 ms (200 fps)
+        let hop = max(1, Int(round(sr * hopSec)))
+        let win = hop * 2
+        let m = (n - win) / hop
+        guard m > 400 else { return nil }
+
+        var env = [Float](repeating: 0, count: m)
+        for f in 0..<m {
+            var rms: Float = 0
+            low.withUnsafeBufferPointer { ptr in
+                vDSP_rmsqv(ptr.baseAddress! + f * hop, 1, &rms, vDSP_Length(win))
+            }
+            env[f] = rms
+        }
+
+        var flux = [Float](repeating: 0, count: m)
+        for f in 1..<m {
+            flux[f] = max(0, env[f] - env[f - 1])
+        }
+
+        // Busca fina (±12% em passos de 0.1 BPM) usando pente multi-batida (1, 2, 4 e 8 batidas)
+        let baseHint = hintBPM > 50 ? hintBPM : 125.0
+        let loBPM = max(65.0, baseHint * 0.88)
+        let hiBPM = min(200.0, baseHint * 1.12)
+        var bestBPM = baseHint
+        var bestScore = -1.0
+        var sumScores = 0.0
+        var countScores = 0
+
+        let startStep = Int(round(loBPM * 10.0))
+        let endStep = Int(round(hiBPM * 10.0))
+        let mults: [(Double, Double)] = [(1.0, 1.0), (2.0, 1.0), (4.0, 1.2), (8.0, 1.0)]
+
+        for step in startStep...endStep {
+            let bpm = Double(step) / 10.0
+            let period = (60.0 / bpm) / hopSec
+            var score = 0.0
+            var weightSum = 0.0
+            for (mult, w) in mults {
+                let lag = Int(round(period * mult))
+                if lag >= m - 20 { continue }
+                var dot: Float = 0
+                flux.withUnsafeBufferPointer { ptr in
+                    vDSP_dotpr(ptr.baseAddress!, 1, ptr.baseAddress! + lag, 1, &dot, vDSP_Length(m - lag))
+                }
+                score += (Double(dot) / Double(m - lag)) * w
+                weightSum += w
+            }
+            guard weightSum > 0 else { continue }
+            let norm = score / weightSum
+            sumScores += norm
+            countScores += 1
+            if norm > bestScore {
+                bestScore = norm
+                bestBPM = bpm
+            }
+        }
+
+        guard countScores > 0 else { return nil }
+        let avgScore = sumScores / Double(countScores)
+        let confidence = avgScore > 1e-9 ? (bestScore / avgScore) : 0.0
+        return (bestBPM, confidence)
+    }
+
+    /// Verifica o BPM real de ambas as faixas nas janelas exatas da transição e corrige `targetRateA` / `initialRateB`
+    /// caso o servidor (`allin1`) ou a análise local tenha arredondado errado o BPM.
+    nonisolated static func refineTransitionPlanWithTrueBPM(
+        plan: TransitionPlan,
+        urlA: URL,
+        urlB: URL
+    ) -> TransitionPlan {
+        guard plan.transitionType == "beatmatch" else { return plan }
+
+        // Janela da Faixa A: 24s terminando logo após `mixStartSec` (pega a batida real na saída)
+        let winStartA = max(0.0, plan.trackA.mixStartSec - 16.0)
+        // Janela da Faixa B: 24s a partir de `entrySec` (pega a batida real na entrada)
+        let winStartB = max(0.0, plan.trackB.entrySec)
+
+        guard let measA = measureLocalTrueBPM(url: urlA, aroundSec: winStartA, windowSec: 24.0, hintBPM: plan.trackA.bpm),
+              let measB = measureLocalTrueBPM(url: urlB, aroundSec: winStartB, windowSec: 24.0, hintBPM: plan.trackB.bpm),
+              measA.confidence >= 1.55, measB.confidence >= 1.55 else {
+            return plan
+        }
+
+        let ratios = [
+            measB.bpm / measA.bpm,
+            (measB.bpm * 2.0) / measA.bpm,
+            (measB.bpm * 0.5) / measA.bpm
+        ]
+        guard let trueRatio = ratios.min(by: { abs(1.0 - $0) < abs(1.0 - $1) }),
+              abs(1.0 - trueRatio) <= 0.15 else {
+            return plan
+        }
+
+        let oldCombinedRatio = Double(plan.sync.targetRateA) / Double(max(plan.sync.initialRateB ?? 1.0, 0.5))
+        guard abs(trueRatio - oldCombinedRatio) >= 0.004 else {
+            return plan
+        }
+
+        var updated = plan
+        updated.trackA = TrackATiming(
+            id: plan.trackA.id,
+            bpm: (measA.bpm * 10.0).rounded() / 10.0,
+            rampStartSec: plan.trackA.rampStartSec,
+            mixStartSec: plan.trackA.mixStartSec,
+            mixEndSec: plan.trackA.mixEndSec,
+            section: plan.trackA.section
+        )
+        updated.trackB = TrackBTiming(
+            id: plan.trackB.id,
+            bpm: (measB.bpm * 10.0).rounded() / 10.0,
+            entrySec: plan.trackB.entrySec,
+            section: plan.trackB.section
+        )
+
+        let newRateA: Float
+        let newRateB: Float
+        if abs(trueRatio - 1.0) <= 0.08 {
+            newRateA = Float(min(max(trueRatio, 0.92), 1.08))
+            newRateB = 1.0
+        } else {
+            let clampedA = min(max(trueRatio, 0.92), 1.08)
+            newRateA = Float(clampedA)
+            newRateB = Float(min(max(clampedA / max(trueRatio, 0.5), 0.93), 1.07))
+        }
+        updated.sync.targetRateA = newRateA
+        updated.sync.initialRateB = newRateB
+
+        // Se o plano original achava que o BPM era igual (sem rampa), cria uma rampa suave variável + hold
+        let rateDelta = Double(abs(newRateA - 1.0))
+        if rateDelta >= 0.003 && (updated.sync.rampDurationSec < 0.5 || updated.trackA.rampStartSec >= updated.trackA.mixStartSec - 1.0) {
+            let barSec = 4.0 * 60.0 / max(measA.bpm, 60.0)
+            let rampBars: Double = rateDelta < 0.020 ? 8.0 : (rateDelta < 0.045 ? 10.0 : 12.0)
+            let holdBars: Double = rateDelta < 0.020 ? 4.0 : (rateDelta < 0.045 ? 6.0 : 8.0)
+            let totalLeadSec = (rampBars + holdBars) * barSec
+            let rampStart = max(updated.trackA.mixStartSec * 0.45, updated.trackA.mixStartSec - totalLeadSec)
+            let actualLead = max(0.0, updated.trackA.mixStartSec - rampStart)
+            updated.trackA.rampStartSec = rampStart
+            updated.sync.rampDurationSec = actualLead * (rampBars / (rampBars + holdBars))
+        }
+
+        print(String(format: "[SYNC-LOCK] TrueBPM corrigido: A=%.1f (conf %.1fx) | B=%.1f (conf %.1fx) → RateA=%.3fx RateB=%.3fx (antes %.3fx)",
+                     measA.bpm, measA.confidence, measB.bpm, measB.confidence,
+                     newRateA, newRateB, plan.sync.targetRateA))
+        return updated
+    }
+
     private func currentTime(for deck: DeckChannel) -> Double {
         if let valid = validRenderTime(for: deck) {
             return valid

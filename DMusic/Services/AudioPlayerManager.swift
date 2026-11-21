@@ -1052,7 +1052,16 @@ final class AudioPlayerManager {
             )
         }
 
-        let plan = applyUserAutomixOverrides(to: rawPlan)
+        var plan = applyUserAutomixOverrides(to: rawPlan)
+
+        // Verifica o BPM real local no PCM das duas faixas (em background) para corrigir arredondamentos
+        // do servidor/allin1 (ex.: 145.3 vs 148.3 BPM enviados como 1.000x)
+        if plan.transitionType == "beatmatch", let localA = localFileURL(for: songA.id) {
+            let basePlan = plan
+            plan = await Task.detached(priority: .userInitiated) {
+                AutomixAudioEngine.refineTransitionPlanWithTrueBPM(plan: basePlan, urlA: localA, urlB: localB)
+            }.value
+        }
 
         guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
         if let coverB = songB.coverArt {
