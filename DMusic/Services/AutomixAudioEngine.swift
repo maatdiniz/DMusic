@@ -1205,65 +1205,64 @@ final class AutomixAudioEngine {
 
         switch curve {
         case .auto, .overlap:
-            // SOBREPOR (Padrão DJ): Faixa B sobe até 100% na mesma intensidade da A (p: 0..0.28).
-            // Faixa A permanece em 100% de volume durante toda a mixagem (sai via filtro/EQ, nunca murcha no fader!).
-            // Micro-rampa anti-pop de apenas 4% no finalzinho (0.96..1.0) para desligar o Deck A sem clique.
-            let vB = p < 0.28 ? sin((p / 0.28) * (.pi / 2.0)) : 1.0
-            let vA: Float = p < 0.96 ? 1.0 : cos(((p - 0.96) / 0.04) * (.pi / 2.0))
+            // SOBREPOR (3 Fases DJ):
+            // Fase 1 (0.00..0.20): Faixa B sobe rápido até 100% de potência.
+            // Fase 2 (0.20..0.70): AMBAS tocam juntas com a Faixa B em potência total e a Faixa A ainda cheia!
+            // Fase 3 (0.70..1.00): Faixa A sai pelo filtro/efeito em 100% de volume (micro-tail anti-pop só em 0.97..1.0).
+            let vB = p < 0.20 ? sin((p / 0.20) * (.pi / 2.0)) : 1.0
+            let vA: Float = p < 0.97 ? 1.0 : cos(((p - 0.97) / 0.03) * (.pi / 2.0))
             return (vA, vB)
 
         case .smoothCrossfade:
             // Último caso (fade cruzado): só reduz volume da A se não houver filtro de saída ativo
-            let vB = sin(p * .pi / 2.0)
+            let vB = p < 0.30 ? sin((p / 0.30) * (.pi / 2.0)) : 1.0
             let vA: Float = hasOutgoingFilter
-                ? (p < 0.94 ? 1.0 : cos(((p - 0.94) / 0.06) * (.pi / 2.0)))
-                : (p < 0.55 ? 1.0 : cos(((p - 0.55) / 0.45) * (.pi / 2.0)))
+                ? (p < 0.96 ? 1.0 : cos(((p - 0.96) / 0.04) * (.pi / 2.0)))
+                : (p < 0.70 ? 1.0 : cos(((p - 0.70) / 0.30) * (.pi / 2.0)))
             return (vA, vB)
 
         case .fadeInFadeOut:
-            let vB = min(p / 0.35, 1.0)
+            let vB = min(p / 0.25, 1.0)
             let vA: Float = hasOutgoingFilter
-                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
-                : (p < 0.55 ? 1.0 : max(0.0, 1.0 - ((p - 0.55) / 0.45)))
+                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
+                : (p < 0.70 ? 1.0 : max(0.0, 1.0 - ((p - 0.70) / 0.30)))
             return (vA, vB)
 
         case .cutInFadeOut:
-            // B entra direta a 100% no Beat 1; A segura 100% até o filtro agir (só abaixa volume se não tiver filtro)
+            // B entra direta a 100% no Beat 1; A segue firme junto e sai pelo filtro no fim
             let r = min(p / 0.025, 1.0)
             let vA: Float = hasOutgoingFilter
-                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
-                : (p < 0.60 ? 1.0 : max(0.0, 1.0 - ((p - 0.60) / 0.40)))
+                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
+                : (p < 0.70 ? 1.0 : max(0.0, 1.0 - ((p - 0.70) / 0.30)))
             return (vA, r)
 
         case .fadeInCutOut:
-            // B sobe até 100% em intensidade igual à A (0..0.40); A segura 100% até o corte seco no fim da frase
-            let vB = min(p / 0.40, 1.0)
-            let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
+            // B atinge 100% cedo (0..0.25); A segue firme junto até o corte seco no fim da frase
+            let vB = min(p / 0.25, 1.0)
+            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
             return (vA, vB)
 
         case .centerCut:
-            // Corte central: B chega a 100% antes do meio e A corta limpo na virada central do compasso
-            let vB = p < 0.45 ? min(p / 0.40, 1.0) : 1.0
+            let vB = p < 0.30 ? min(p / 0.25, 1.0) : 1.0
             let vA: Float = p < 0.50 ? 1.0 : max(0.0, 1.0 - ((p - 0.50) / 0.04))
             return (vA, vB)
 
         case .crossfadeQuickOut:
-            // B atinge 100% até 0.35; A segura 100% até o final quando há filtro (sem abaixar volume antes da hora)
-            let vB = min(p / 0.35, 1.0)
+            let vB = min(p / 0.25, 1.0)
             let vA: Float = hasOutgoingFilter
-                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
-                : (p < 0.65 ? 1.0 : max(0.0, 1.0 - ((p - 0.65) / 0.35)))
+                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
+                : (p < 0.72 ? 1.0 : max(0.0, 1.0 - ((p - 0.72) / 0.28)))
             return (vA, vB)
 
         case .fadeIn1BarCutOut:
             let vB = min(p / oneBarFrac, 1.0)
-            let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
+            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
             return (vA, vB)
 
         case .overlap1BarCutOut:
             let startB = max(0.0, 1.0 - oneBarFrac)
             let vB: Float = p < startB ? 0.0 : min((p - startB) / 0.025, 1.0)
-            let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
+            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
             return (vA, vB)
         }
     }
@@ -1302,29 +1301,24 @@ final class AutomixAudioEngine {
 
         switch style {
         case .auto, .centerBassSwap:
-            // Troca de Grave Central (50% da transição)
-            applyBassWindow(center: swapCenter > 0.05 ? swapCenter : 0.50, width: 0.14)
+            // Troca de Grave cedo (32%) para a B já atingir potência total e conviver com a A por um bom tempo
+            applyBassWindow(center: 0.32, width: 0.10)
 
         case .startBassSwap:
-            // Início da troca de graves (~20% da transição)
-            applyBassWindow(center: 0.20, width: 0.14)
+            applyBassWindow(center: 0.18, width: 0.10)
 
         case .endBassSwap:
-            // Fim da troca de graves (~80% da transição)
-            applyBassWindow(center: 0.80, width: 0.14)
+            applyBassWindow(center: 0.65, width: 0.12)
 
         case .quickBassCut:
-            // Corte rápido de graves exatamente na virada central do compasso (janela de 3%)
-            applyBassWindow(center: 0.50, width: 0.03)
+            applyBassWindow(center: 0.32, width: 0.03)
 
         case .longBassCut:
-            // Corte longo e progressivo de graves ao longo de 70% da transição
-            applyBassWindow(center: 0.50, width: 0.70)
+            applyBassWindow(center: 0.38, width: 0.45)
 
         case .bassFadeOut:
-            // Fade out contínuo dos graves da A desde 0% até 75%, enquanto o grave da B sobe de 25% a 85%
-            let sA = min(max(p / 0.75, 0.0), 1.0)
-            let sB = min(max((p - 0.25) / 0.60, 0.0), 1.0)
+            let sA = min(max(p / 0.45, 0.0), 1.0)
+            let sB = min(max((p - 0.15) / 0.30, 0.0), 1.0)
             if !primeOnlyIncoming {
                 outBands[0].gain = cutDb * sA
                 outBands[1].gain = 0.0
@@ -1335,20 +1329,20 @@ final class AutomixAudioEngine {
             inBands[2].gain = 0.0
 
         case .threeBandTransition:
-            // Transição de 3 Bandas tipo Mixer DJ:
-            // 1º: Agudos e Médios da B sobem cedo para acompanhar a A na mesma intensidade
-            // 2º: Graves trocam de golpe após a B já estar presente (0.48..0.58)
-            // 3º: Se já houver filtro na saída da A, evita empilhar corte de -15 dB em médios/agudos para a A não ficar muda!
-            let lowS = min(max((p - 0.48) / 0.10, 0.0), 1.0)
-            let midInS = min(max((p - 0.18) / 0.35, 0.0), 1.0)
-            let midOutS = min(max((p - 0.58) / 0.35, 0.0), 1.0)
-            let highInS = min(max((p - 0.04) / 0.25, 0.0), 1.0)
-            let highOutS = min(max((p - 0.72) / 0.26, 0.0), 1.0)
+            // Transição de 3 Bandas (3 Fases DJ):
+            // 1º (0.00..0.35): Agudos, Médios e Graves da B chegam a 100% de potência cedo!
+            // 2º (0.35..0.70): Ambas tocam juntas com a A clara em médios/agudos e B em potência total!
+            // 3º (0.70..1.00): Só no final os médios/agudos da A recuam suavemente junto com o filtro de saída.
+            let lowS = min(max((p - 0.25) / 0.10, 0.0), 1.0)
+            let midInS = min(max((p - 0.08) / 0.22, 0.0), 1.0)
+            let midOutS = min(max((p - 0.70) / 0.28, 0.0), 1.0)
+            let highInS = min(max(p / 0.16, 0.0), 1.0)
+            let highOutS = min(max((p - 0.76) / 0.22, 0.0), 1.0)
 
-            let midCutIn: Float = -12.0
-            let highCutIn: Float = -10.0
-            let midCutOut: Float = hasOutgoingFilter ? -5.0 : -14.0
-            let highCutOut: Float = hasOutgoingFilter ? 0.0 : -12.0
+            let midCutIn: Float = -10.0
+            let highCutIn: Float = -8.0
+            let midCutOut: Float = hasOutgoingFilter ? -4.0 : -12.0
+            let highCutOut: Float = hasOutgoingFilter ? 0.0 : -10.0
 
             if !primeOnlyIncoming {
                 outBands[0].gain = cutDb * lowS
@@ -1385,10 +1379,11 @@ final class AutomixAudioEngine {
         var inHP: Float? = nil
         var inLP: Float? = nil
 
-        // Na entrada (B): o filtro abre rápido até p = 0.42 para a batida da B acompanhar a A na mesma intensidade
-        let inSweep = min(max(p / 0.42, 0.0), 1.0)
-        // Na saída (A): o filtro SÓ começa a atuar em p = 0.58, depois da B já estar cheia e com o grave trocado!
-        let outSweep = min(max((p - 0.58) / 0.42, 0.0), 1.0)
+        // Fase 1 (0.00..0.25): filtro de entrada da B abre completamente cedo para ela já tocar em potência total!
+        let inSweep = min(max(p / 0.25, 0.0), 1.0)
+        // Fase 2 (0.25..0.70): AMBAS tocam juntas sem filtro na A (convivência plena das duas faixas)!
+        // Fase 3 (0.70..1.00): só no terço final entra o filtro/efeito de saída da Faixa A.
+        let outSweep = min(max((p - 0.70) / 0.30, 0.0), 1.0)
 
         switch style {
         case .none:

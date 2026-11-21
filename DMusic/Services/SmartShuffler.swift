@@ -5,11 +5,40 @@ import Foundation
 nonisolated enum SmartShuffler {
     struct TrackMeta: Sendable {
         let id: String
+        let titleKey: String // Título normalizado para nunca enfileirar versões repetidas da mesma música
         let bpm: Double
         let camelot: CamelotKey
         let energy: Double // 0.0 a 1.0
         let vibe: [Float]? // Vetor 24D Z-score L2 (timbre, bandas, harmonia/percussão, groove)
         let genre: String? // Gênero normalizado (Navidrome) para desempate sutil
+    }
+
+    /// Normaliza o título para detectar duplicatas/versões da mesma música
+    /// (ex.: "Control Freak", "Schacke - Control Freak", "Control Freak (Mixed)").
+    static func normalizedTitleKey(_ raw: String, artist: String? = nil) -> String {
+        var s = raw.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        // Remove prefixo "Artista - Título" se presente
+        if let dashRange = s.range(of: " - ") {
+            let suffix = String(s[dashRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if suffix.count >= 3 {
+                s = suffix
+            }
+        }
+        // Remove sufixos de edição/qualidade entre parênteses ou colchetes: (Mixed), (Edit), (Mastered), [Remaster], etc.
+        let editionTokens = ["mixed", "edit", "mastered", "remaster", "remastered", "original mix", "extended", "radio", "clean", "explicit", "version", "mix"]
+        while let open = s.lastIndex(where: { $0 == "(" || $0 == "[" }),
+              let close = s[open...].firstIndex(where: { $0 == ")" || $0 == "]" }),
+              close == s.index(before: s.endIndex) {
+            let inner = s[s.index(after: open)..<close].trimmingCharacters(in: .whitespacesAndNewlines)
+            if editionTokens.contains(where: { inner.contains($0) }) {
+                s = String(s[..<open]).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                break
+            }
+        }
+        // Mantém apenas letras e números colapsando espaços
+        let cleaned = s.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+        return String(cleaned).split(separator: " ").joined(separator: " ")
     }
 
     struct ScoreBreakdown: Sendable {
@@ -33,6 +62,18 @@ nonisolated enum SmartShuffler {
 
     /// Calcula pontuação detalhada de 0 a 100 entre duas faixas (com consciência de Vibe/Emoção).
     static func scoreBreakdown(from a: TrackMeta, to b: TrackMeta) -> ScoreBreakdown {
+        // Nunca pontua bem duas versões/cópias da mesma música seguidas
+        if !a.titleKey.isEmpty && a.titleKey == b.titleKey {
+            return ScoreBreakdown(
+                bpmPoints: 0,
+                camelotPoints: 0,
+                energyPoints: 0,
+                vibePoints: 0,
+                vibeSimilarity: 0,
+                total: 0
+            )
+        }
+
         let hasVibe = (a.vibe?.isEmpty == false) && (b.vibe?.isEmpty == false) && a.vibe?.count == b.vibe?.count
         let sameGenre: Bool = {
             guard let ga = a.genre, let gb = b.genre, !ga.isEmpty, !gb.isEmpty else { return false }
@@ -46,13 +87,13 @@ nonisolated enum SmartShuffler {
             let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot) * (20.0 / 35.0)
             let engPts = energyScore(energyA: a.energy, energyB: b.energy) * (8.0 / 15.0)
 
-            // Mapeia cosseno [-0.20 ... +0.92] -> [0 ... 1] com curva que premia fortemente mesma atmosfera/timbre
-            let simNorm = min(1.0, max(0.0, (cos + 0.20) / 1.12))
-            var vibePts = 36.0 * pow(simNorm, 1.40)
-            // Penalidade forte de choque de clima quando duas faixas pertencem a universos sonoros opostos
-            if cos < 0.20 {
-                let clash = min(1.0, (0.20 - cos) / 0.50)
-                vibePts -= 24.0 * clash
+            // Mapeia cosseno [-0.15 ... +0.92] -> [0 ... 1] com curva que premia fortemente mesma atmosfera/timbre
+            let simNorm = min(1.0, max(0.0, (cos + 0.15) / 1.07))
+            var vibePts = 36.0 * pow(simNorm, 1.45)
+            // Penalidade severa de choque de clima (evita misturar eletrônica/techno com reggaeton/funk)
+            if cos < 0.28 {
+                let clash = min(1.0, (0.28 - cos) / 0.55)
+                vibePts -= 30.0 * clash
             }
             let genreBonus = sameGenre ? 4.0 : 0.0
             let total = min(100.0, max(0.0, bpmPts + camPts + engPts + vibePts + genreBonus))
@@ -65,12 +106,12 @@ nonisolated enum SmartShuffler {
                 total: total
             )
         } else {
-            // Fallback clássico (50 + 35 + 15) quando ainda não há vetor de vibe
+            // Fallback sem vetor de vibe: teto de 75 pts para nunca roubar lugar de uma faixa com Vibe IA confirmada
             let bpmPts = bpmScore(bpmA: a.bpm, bpmB: b.bpm)
             let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot)
             let engPts = energyScore(energyA: a.energy, energyB: b.energy)
             let genreBonus = sameGenre ? 5.0 : 0.0
-            let total = min(100.0, bpmPts + camPts + engPts + genreBonus)
+            let total = min(75.0, (bpmPts + camPts + engPts + genreBonus) * 0.75)
             return ScoreBreakdown(
                 bpmPoints: bpmPts,
                 camelotPoints: camPts,
@@ -152,16 +193,68 @@ nonisolated enum SmartShuffler {
         return clean.isEmpty ? nil : clean
     }
 
-    private static func toTrackMeta(_ meta: TrackMixMetadata, genre: String? = nil) -> TrackMeta? {
+    private static func toTrackMeta(_ meta: TrackMixMetadata, title: String = "", artist: String? = nil, genre: String? = nil) -> TrackMeta? {
         guard let cam = CamelotKey(code: meta.camelot) else { return nil }
         return TrackMeta(
             id: meta.songId,
+            titleKey: normalizedTitleKey(title, artist: artist),
             bpm: meta.effectiveBPM,
             camelot: cam,
             energy: meta.energy ?? 0.5,
             vibe: meta.vibe,
             genre: normalizedGenre(genre)
         )
+    }
+
+    /// Remove duplicatas de mesmo título na fila do Smart Shuffle (ex.: mesma música em MP3 e FLAC ou versões repetidas),
+    /// mantendo sempre a faixa âncora e, entre duplicatas, preferindo a analisada por IA (`allin1` com vibe) e de maior qualidade.
+    private static func deduplicateSameTitles(
+        songs: [Song],
+        metadata: [String: TrackMixMetadata],
+        anchor: Song?
+    ) -> [Song] {
+        func qualityRank(_ song: Song) -> Int {
+            var score = 0
+            if let m = metadata[song.id] {
+                if m.analyzer == "allin1" { score += 10_000 }
+                if m.vibe?.isEmpty == false { score += 5_000 }
+            }
+            if song.isHiRes { score += 2_000 }
+            let suffix = (song.suffix ?? "").lowercased()
+            if suffix == "flac" || suffix == "alac" || suffix == "wav" || suffix == "aiff" { score += 1_000 }
+            score += min(song.bitRate ?? 0, 999)
+            return score
+        }
+
+        var bestByTitle: [String: Song] = [:]
+        var orderKeys: [String] = []
+        let anchorKey = anchor.map { normalizedTitleKey($0.title, artist: $0.artist) }
+
+        if let anchor, let ak = anchorKey, !ak.isEmpty {
+            bestByTitle[ak] = anchor
+            orderKeys.append(ak)
+        }
+
+        for song in songs {
+            if let anchor, song.id == anchor.id { continue }
+            let key = normalizedTitleKey(song.title, artist: song.artist)
+            guard !key.isEmpty else {
+                bestByTitle["__id_\(song.id)"] = song
+                orderKeys.append("__id_\(song.id)")
+                continue
+            }
+            if let existing = bestByTitle[key] {
+                // Nunca substitui a faixa âncora que já está tocando
+                if let anchor, existing.id == anchor.id { continue }
+                if qualityRank(song) > qualityRank(existing) {
+                    bestByTitle[key] = song
+                }
+            } else {
+                bestByTitle[key] = song
+                orderKeys.append(key)
+            }
+        }
+        return orderKeys.compactMap { bestByTitle[$0] }
     }
 
     /// Executa algoritmo guloso com consciência de escassez de BPM + Top K controlado + Multi-Start
@@ -177,12 +270,18 @@ nonisolated enum SmartShuffler {
     ) -> [Song] {
         guard songs.count > 1 else { return songs }
 
-        // Separa em: analisadas no servidor `allin1`, analisadas só localmente e sem análise
+        // Deduplica versões repetidas do mesmo título antes de montar a fila
+        let uniqueSongs = deduplicateSameTitles(songs: songs, metadata: metadata, anchor: anchor)
+        guard uniqueSongs.count > 1 else { return uniqueSongs }
+
+        // Separa em: analisadas no servidor `allin1` (com beatgrid + vetor Vibe 24D), analisadas só localmente e sem análise.
+        // Mantém sempre o bloco `allin1` separado na frente para evitar que faixas `MIX LOCAL` (sem Vibe e sem beatgrid)
+        // furem a fila e causem saltos de estilo (ex.: eletrônica -> reggaeton) ou batidas desalinhadas.
         var serverEntries: [(song: Song, meta: TrackMeta)] = []
         var localEntries: [(song: Song, meta: TrackMeta)] = []
         var unanalyzedSongs: [Song] = []
-        for s in songs {
-            if let raw = metadata[s.id], let tm = toTrackMeta(raw, genre: s.genre) {
+        for s in uniqueSongs {
+            if let raw = metadata[s.id], let tm = toTrackMeta(raw, title: s.title, artist: s.artist, genre: s.genre) {
                 if raw.analyzer == "allin1" {
                     serverEntries.append((s, tm))
                 } else {
@@ -193,64 +292,40 @@ nonisolated enum SmartShuffler {
             }
         }
 
-        // Quando as faixas IA cobrem a maioria (>= locais), unifica todas analisadas em um pool único
-        // para evitar quebra artificial no meio da fila entre "allin1" e "local".
-        let unifyAnalyzed = serverEntries.count >= localEntries.count
         var finalQueue: [Song] = []
-        finalQueue.reserveCapacity(songs.count)
+        finalQueue.reserveCapacity(uniqueSongs.count)
 
-        if unifyAnalyzed {
-            let combined = serverEntries + localEntries
-            let anchorInCombined = anchor.map { anc in combined.contains(where: { $0.song.id == anc.id }) } ?? false
-            if let anchor, !anchorInCombined {
-                finalQueue.append(anchor)
-            }
-            let ordered = bestMixOrder(
-                for: combined,
-                anchorId: anchorInCombined ? anchor?.id : nil,
-                maxAttempts: maxAttempts,
-                maxDurationSec: maxDurationSec,
-                topK: topK
-            )
-            finalQueue.append(contentsOf: ordered)
+        let anchorInServer = anchor.map { anc in serverEntries.contains(where: { $0.song.id == anc.id }) } ?? false
+        let anchorInLocal = anchor.map { anc in localEntries.contains(where: { $0.song.id == anc.id }) } ?? false
 
-            let remUnanalyzed = (anchor != nil && !anchorInCombined)
-                ? unanalyzedSongs.filter { $0.id != anchor?.id }
-                : unanalyzedSongs
-            finalQueue.append(contentsOf: remUnanalyzed.shuffled())
-        } else {
-            let anchorInServer = anchor.map { anc in serverEntries.contains(where: { $0.song.id == anc.id }) } ?? false
-            let anchorInLocal = anchor.map { anc in localEntries.contains(where: { $0.song.id == anc.id }) } ?? false
-
-            if let anchor, !anchorInServer {
-                finalQueue.append(anchor)
-            }
-            let orderedServer = bestMixOrder(
-                for: serverEntries,
-                anchorId: anchorInServer ? anchor?.id : nil,
-                maxAttempts: maxAttempts,
-                maxDurationSec: maxDurationSec,
-                topK: topK
-            )
-            finalQueue.append(contentsOf: orderedServer)
-
-            let remainingLocal = (anchor != nil && !anchorInServer && anchorInLocal)
-                ? localEntries.filter { $0.song.id != anchor?.id }
-                : localEntries
-            let orderedLocal = bestMixOrder(
-                for: remainingLocal,
-                anchorId: nil,
-                maxAttempts: maxAttempts,
-                maxDurationSec: maxDurationSec,
-                topK: topK
-            )
-            finalQueue.append(contentsOf: orderedLocal)
-
-            let remUnanalyzed = (anchor != nil && !anchorInServer && !anchorInLocal)
-                ? unanalyzedSongs.filter { $0.id != anchor?.id }
-                : unanalyzedSongs
-            finalQueue.append(contentsOf: remUnanalyzed.shuffled())
+        if let anchor, !anchorInServer {
+            finalQueue.append(anchor)
         }
+        let orderedServer = bestMixOrder(
+            for: serverEntries,
+            anchorId: anchorInServer ? anchor?.id : nil,
+            maxAttempts: maxAttempts,
+            maxDurationSec: maxDurationSec,
+            topK: topK
+        )
+        finalQueue.append(contentsOf: orderedServer)
+
+        let remainingLocal = (anchor != nil && !anchorInServer && anchorInLocal)
+            ? localEntries.filter { $0.song.id != anchor?.id }
+            : localEntries
+        let orderedLocal = bestMixOrder(
+            for: remainingLocal,
+            anchorId: nil,
+            maxAttempts: maxAttempts,
+            maxDurationSec: maxDurationSec,
+            topK: topK
+        )
+        finalQueue.append(contentsOf: orderedLocal)
+
+        let remUnanalyzed = (anchor != nil && !anchorInServer && !anchorInLocal)
+            ? unanalyzedSongs.filter { $0.id != anchor?.id }
+            : unanalyzedSongs
+        finalQueue.append(contentsOf: remUnanalyzed.shuffled())
 
         return finalQueue
     }
@@ -284,8 +359,8 @@ nonisolated enum SmartShuffler {
             let cur = orderedSongs[i]
             let mA = metadata[prev.id]
             let mB = metadata[cur.id]
-            let tmA = mA.flatMap { toTrackMeta($0, genre: prev.genre) }
-            let tmB = mB.flatMap { toTrackMeta($0, genre: cur.genre) }
+            let tmA = mA.flatMap { toTrackMeta($0, title: prev.title, artist: prev.artist, genre: prev.genre) }
+            let tmB = mB.flatMap { toTrackMeta($0, title: cur.title, artist: cur.artist, genre: cur.genre) }
 
             let bpmPts: Double
             let camPts: Double
