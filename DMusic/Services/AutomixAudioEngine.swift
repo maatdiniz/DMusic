@@ -28,6 +28,7 @@ nonisolated private final class DeckPCMStreamer: @unchecked Sendable {
     private var chunkOutFrames: AVAudioFrameCount = AVAudioFrameCount(48_000 * chunkSeconds)
     private var reachedInputEOF = false
     private var reachedOutputEOF = false
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
 
     init(fileURL: URL, startAtSec: Double, node: AVAudioPlayerNode) {
         self.fileURL = fileURL
@@ -45,6 +46,9 @@ nonisolated private final class DeckPCMStreamer: @unchecked Sendable {
         lock.lock()
         cancelled = true
         lock.unlock()
+        queue.async { [weak self] in
+            self?.pendingBuffers.removeAll()
+        }
     }
 
     /// Prepara e agenda os primeiros blocos no `playerNode` (`syncBuffers` de forma síncrona e o restante em fila serial).
@@ -71,6 +75,64 @@ nonisolated private final class DeckPCMStreamer: @unchecked Sendable {
             }
         }
         return true
+    }
+
+    /// Pré-decodifica os primeiros blocos em RAM sem agendar ainda no `playerNode`,
+    /// permitindo inserir silêncio exato em frames antes do disparo para sincronia sample-accurate (< 1 ms).
+    func primeToMemory(bufferCount: Int = 2) -> Bool {
+        var primedOK = false
+        queue.sync {
+            guard !self.isCancelled else { return }
+            guard self.prepareReaderOnQueue() else { return }
+            self.pendingBuffers.removeAll()
+            let count = max(1, bufferCount)
+            for i in 0..<count {
+                if self.isCancelled || self.reachedOutputEOF { break }
+                if let buf = self.decodeOneBufferOnQueue() {
+                    self.pendingBuffers.append(buf)
+                    if i == 0 { primedOK = true }
+                }
+            }
+        }
+        return primedOK
+    }
+
+    /// Agenda o silêncio de pré-rolagem exato + os blocos já decodificados em RAM no `playerNode` e continua o streaming.
+    func commitPendingAndStartStreaming(prerollSilenceFrames: Int) -> Bool {
+        var committed = false
+        queue.sync {
+            guard !self.isCancelled, let targetNode = self.nodeBox.node, !self.pendingBuffers.isEmpty else { return }
+            if prerollSilenceFrames > 0,
+               let silenceBuf = AVAudioPCMBuffer(pcmFormat: Self.renderFormat, frameCapacity: AVAudioFrameCount(prerollSilenceFrames)) {
+                silenceBuf.frameLength = AVAudioFrameCount(prerollSilenceFrames)
+                // AVAudioPCMBuffer recém-alocado pode conter lixo; zera explicitamente todos os canais
+                if let ch = silenceBuf.floatChannelData {
+                    let bytes = prerollSilenceFrames * MemoryLayout<Float>.size
+                    for c in 0..<Int(Self.renderFormat.channelCount) {
+                        memset(ch[c], 0, bytes)
+                    }
+                }
+                targetNode.scheduleBuffer(silenceBuf, completionHandler: nil)
+            }
+            for buf in self.pendingBuffers {
+                targetNode.scheduleBuffer(buf, completionCallbackType: .dataConsumed) { [weak self] _ in
+                    guard let self else { return }
+                    self.queue.async {
+                        guard !self.isCancelled, !self.reachedOutputEOF else { return }
+                        _ = self.decodeAndScheduleOneOnQueue()
+                    }
+                }
+            }
+            self.pendingBuffers.removeAll()
+            committed = true
+        }
+        if committed {
+            queue.async { [weak self] in
+                guard let self, !self.isCancelled, !self.reachedOutputEOF else { return }
+                _ = self.decodeAndScheduleOneOnQueue()
+            }
+        }
+        return committed
     }
 
     private func prepareReaderOnQueue() -> Bool {
@@ -107,12 +169,11 @@ nonisolated private final class DeckPCMStreamer: @unchecked Sendable {
         }
     }
 
-    private func decodeAndScheduleOneOnQueue() -> Bool {
+    private func decodeOneBufferOnQueue() -> AVAudioPCMBuffer? {
         guard !isCancelled, !reachedOutputEOF,
               let file, let converter, let srcScratch,
-              let targetNode = nodeBox.node,
               let outBuffer = AVAudioPCMBuffer(pcmFormat: Self.renderFormat, frameCapacity: chunkOutFrames) else {
-            return false
+            return nil
         }
 
         var convError: NSError?
@@ -140,13 +201,20 @@ nonisolated private final class DeckPCMStreamer: @unchecked Sendable {
 
         if status == .error || outBuffer.frameLength == 0 {
             reachedOutputEOF = true
-            return false
+            return nil
         }
         if status == .endOfStream {
             reachedOutputEOF = true
         }
+        guard !isCancelled else { return nil }
+        return outBuffer
+    }
 
-        guard !isCancelled else { return false }
+    private func decodeAndScheduleOneOnQueue() -> Bool {
+        guard let targetNode = nodeBox.node,
+              let outBuffer = decodeOneBufferOnQueue() else {
+            return false
+        }
 
         targetNode.scheduleBuffer(outBuffer, completionCallbackType: .dataConsumed) { [weak self] _ in
             guard let self else { return }
@@ -197,6 +265,7 @@ final class AutomixAudioEngine {
         var loudnessPeakDB: Float? = nil
         var streamer: DeckPCMStreamer?
         var segmentStartSec: Double = 0
+        var prerollSilenceSec: Double = 0
         var fileDuration: Double = 0
         var isPaused = false
 
@@ -467,6 +536,7 @@ final class AutomixAudioEngine {
         deck.playerNode.stop()
         deck.playerNode.reset()
         deck.resetDSPToNeutral()
+        deck.prerollSilenceSec = 0
         deck.isPaused = false
     }
 
@@ -484,8 +554,117 @@ final class AutomixAudioEngine {
             return nil
         }
         let pRate = playerTime.sampleRate > 0 ? playerTime.sampleRate : Self.renderFormat.sampleRate
-        let elapsed = max(0, Double(playerTime.sampleTime) / pRate)
+        let elapsed = max(0, Double(playerTime.sampleTime) / pRate - deck.prerollSilenceSec)
         return min(deck.segmentStartSec + elapsed, deck.fileDuration)
+    }
+
+    /// Detecta o ataque real da batida/bumbo (kick onset) no PCM decodificado pelo próprio `AVAudioFile`
+    /// numa janela de ±90 ms ao redor do timestamp planejado. Elimina qualquer desvio de priming MP3/AAC
+    /// entre `ffmpeg`/`allin1` e o decoder da Apple. Retorna `targetSec` inalterado em trechos sem percussão clara.
+    private static func snapToNearestBeatOnset(url: URL, targetSec: Double, maxShiftSec: Double = 0.085) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return targetSec }
+        let sr = file.processingFormat.sampleRate
+        let totalFrames = file.length
+        guard sr >= 8_000, totalFrames > 4_096 else { return targetSec }
+        let dur = Double(totalFrames) / sr
+
+        let searchRadius = maxShiftSec + 0.015
+        let winStart = max(0.0, targetSec - searchRadius)
+        let winEnd = min(dur - 0.02, targetSec + searchRadius)
+        guard winEnd - winStart >= 0.06 else { return targetSec }
+
+        let startFrame = AVAudioFramePosition(winStart * sr)
+        let frameCount = AVAudioFrameCount(min(Double(totalFrames - startFrame), (winEnd - winStart) * sr))
+        guard frameCount >= 512,
+              let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount) else {
+            return targetSec
+        }
+
+        file.framePosition = startFrame
+        do {
+            try file.read(into: buf, frameCount: frameCount)
+        } catch {
+            return targetSec
+        }
+
+        let n = Int(buf.frameLength)
+        guard n >= 512, let chData = buf.floatChannelData else { return targetSec }
+        let chCount = Int(buf.format.channelCount)
+
+        // Mix para mono Float32
+        var mono = [Float](repeating: 0, count: n)
+        if chCount == 1 {
+            memcpy(&mono, chData[0], n * MemoryLayout<Float>.size)
+        } else {
+            var scale: Float = 1.0 / Float(chCount)
+            for c in 0..<chCount {
+                vDSP_vsma(chData[c], 1, &scale, mono, 1, &mono, 1, vDSP_Length(n))
+            }
+        }
+
+        // Filtro passa-baixa de 1 polo (~220 Hz) para isolar o ataque do bumbo (kick)
+        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 220.0 / sr))
+        var low = [Float](repeating: 0, count: n)
+        var y: Float = 0
+        for i in 0..<n {
+            y += alpha * (mono[i] - y)
+            low[i] = y
+        }
+
+        // Energia combinada (70% graves/bumbo + 30% banda larga) em quadros de 5 ms com salto de 2.5 ms
+        let hop = max(1, Int(round(sr * 0.0025)))
+        let win = max(hop * 2, Int(round(sr * 0.005)))
+        let numFrames = (n - win) / hop
+        guard numFrames >= 8 else { return targetSec }
+
+        var energies = [Float](repeating: 0, count: numFrames)
+        for f in 0..<numFrames {
+            let offset = f * hop
+            var rmsLow: Float = 0
+            var rmsFull: Float = 0
+            low.withUnsafeBufferPointer { ptr in
+                vDSP_rmsqv(ptr.baseAddress! + offset, 1, &rmsLow, vDSP_Length(win))
+            }
+            mono.withUnsafeBufferPointer { ptr in
+                vDSP_rmsqv(ptr.baseAddress! + offset, 1, &rmsFull, vDSP_Length(win))
+            }
+            energies[f] = 0.70 * rmsLow + 0.30 * rmsFull
+        }
+
+        // Fluxo de onset positivo (subida súbita de energia = ataque da batida)
+        var flux = [Float](repeating: 0, count: numFrames)
+        for f in 1..<numFrames {
+            flux[f] = max(0, energies[f] - energies[f - 1])
+        }
+
+        // Mediana do fluxo para garantir que só faz snap em transientes reais (ignora intros/outros ambientes)
+        let sortedFlux = flux.sorted()
+        let medianFlux = max(sortedFlux[sortedFlux.count / 2], 1e-6)
+
+        // Ponderação suave favorecendo onsets próximos ao timestamp planejado
+        var bestIdx = -1
+        var bestScore: Float = 0
+        var bestRawFlux: Float = 0
+        for f in 1..<numFrames {
+            let frameSec = winStart + Double(f * hop) / sr
+            let dist = abs(frameSec - targetSec)
+            guard dist <= maxShiftSec else { continue }
+            let weight = Float(1.0 - 0.30 * (dist / maxShiftSec))
+            let score = flux[f] * weight
+            if score > bestScore {
+                bestScore = score
+                bestRawFlux = flux[f]
+                bestIdx = f
+            }
+        }
+
+        guard bestIdx >= 1, bestRawFlux >= medianFlux * 2.8, bestRawFlux >= 0.002 else {
+            return targetSec
+        }
+
+        // Recua 1 salto (~2.5 ms) para o início exato da rampa de ataque do bumbo
+        let snappedSec = winStart + Double(max(0, bestIdx - 1) * hop) / sr
+        return min(max(0.0, snappedSec), dur - 0.05)
     }
 
     private func currentTime(for deck: DeckChannel) -> Double {
@@ -591,6 +770,53 @@ final class AutomixAudioEngine {
 
         let sr = fileB.processingFormat.sampleRate
         let totalDur = Double(fileB.length) / max(sr, 1)
+
+        // 1. Micro-alinhamento de batida no PCM real (elimina desvio de priming MP3/AAC e jitter de downbeat)
+        if effectivePlan.transitionType == "beatmatch" {
+            let origMixStart = effectivePlan.trackA.mixStartSec
+            let origEntryB = effectivePlan.trackB.entrySec
+
+            if let urlA = activeDeck.file?.url, durA > 0, now < origMixStart - 0.5 {
+                let snappedA = Self.snapToNearestBeatOnset(url: urlA, targetSec: origMixStart)
+                let deltaA = snappedA - origMixStart
+                if abs(deltaA) >= 0.002 && abs(deltaA) <= 0.085 {
+                    effectivePlan.trackA.mixStartSec = snappedA
+                    effectivePlan.trackA.mixEndSec = min(durA - 0.15, effectivePlan.trackA.mixEndSec + deltaA)
+                }
+            }
+
+            let snappedB = Self.snapToNearestBeatOnset(url: fileB.url, targetSec: origEntryB)
+            let deltaB = snappedB - origEntryB
+            if abs(deltaB) >= 0.002 && abs(deltaB) <= 0.085 {
+                effectivePlan.trackB.entrySec = snappedB
+            }
+
+            // 2. Alinhamento rápido de BPM: rampa curta de 2–4 compassos + 1 compasso travado antes da entrada
+            //    para que o TimePitch esteja 100% estável em fase antes do disparo do Deck B.
+            let rateDelta = Double(abs(effectivePlan.sync.targetRateA - 1.0))
+            if rateDelta >= 0.003 {
+                let barSec = 4.0 * 60.0 / max(effectivePlan.trackA.bpm, 60.0)
+                let rampBars: Double = rateDelta < 0.020 ? 2.0 : (rateDelta < 0.045 ? 3.0 : 4.0)
+                let holdBars: Double = 1.0
+                let fastRampSec = min(max(rampBars * barSec, 2.5), 9.0)
+                let fastHoldSec = min(max(holdBars * barSec, 1.4), 2.5)
+                let fastLeadSec = fastRampSec + fastHoldSec
+                let desiredRampStart = max(0.0, effectivePlan.trackA.mixStartSec - fastLeadSec)
+                if desiredRampStart > effectivePlan.trackA.rampStartSec {
+                    effectivePlan.trackA.rampStartSec = desiredRampStart
+                    effectivePlan.sync.rampDurationSec = fastRampSec
+                }
+            }
+
+            let dAMs = Int(((effectivePlan.trackA.mixStartSec - origMixStart) * 1000.0).rounded())
+            let dBMs = Int(((effectivePlan.trackB.entrySec - origEntryB) * 1000.0).rounded())
+            print(String(format: "[SYNC-LOCK] BeatSnap A:%+dms (%.3fs) | B:%+dms (%.3fs) | Ramp:%.1fs→%.1fs | RateA:%.3fx RateB:%.3fx",
+                         dAMs, effectivePlan.trackA.mixStartSec,
+                         dBMs, effectivePlan.trackB.entrySec,
+                         effectivePlan.trackA.rampStartSec, effectivePlan.trackA.mixStartSec,
+                         effectivePlan.sync.targetRateA, effectivePlan.sync.initialRateB ?? 1.0))
+        }
+
         let clampedEntry = min(max(effectivePlan.trackB.entrySec, 0), max(totalDur - 4.0, 0))
 
         activeDeck.nominalBPM = effectivePlan.trackA.bpm
@@ -599,6 +825,7 @@ final class AutomixAudioEngine {
         incoming.nominalBPM = effectivePlan.trackB.bpm
         incoming.fileDuration = totalDur
         incoming.segmentStartSec = clampedEntry
+        incoming.prerollSilenceSec = 0
         incoming.timePitch.rate = effectivePlan.sync.initialRateB ?? 1.0
         incoming.timePitch.pitch = 0.0
         incoming.playerNode.volume = 0.0
@@ -610,7 +837,7 @@ final class AutomixAudioEngine {
 
         let streamer = DeckPCMStreamer(fileURL: fileB.url, startAtSec: clampedEntry, node: incoming.playerNode)
         incoming.streamer = streamer
-        guard streamer.primeAndStartStreaming(syncBuffers: 2, totalInitialBuffers: 3) else {
+        guard streamer.primeToMemory(bufferCount: 2) else {
             resetDeckNode(incoming)
             incoming.file = nil
             incoming.songId = nil
@@ -684,7 +911,7 @@ final class AutomixAudioEngine {
         stopMonitoring()
         activeDeck.playerNode.pause()
         activeDeck.isPaused = true
-        if hasStartedIncoming {
+        if hasStartedIncoming || hasTriggeredPlayAtFuture {
             incomingDeck.playerNode.pause()
             incomingDeck.isPaused = true
         }
@@ -697,7 +924,7 @@ final class AutomixAudioEngine {
         ensureRunning()
         activeDeck.playerNode.play()
         activeDeck.isPaused = false
-        if hasStartedIncoming {
+        if hasStartedIncoming || hasTriggeredPlayAtFuture {
             incomingDeck.playerNode.play()
             incomingDeck.isPaused = false
         }
@@ -844,10 +1071,12 @@ final class AutomixAudioEngine {
             reportPhase(.ramping, plan: plan)
         }
 
-        // 2. Disparo exato da Faixa B com relógio de hardware (AVAudioTime) quando falta <= 35 ms para o downbeat
+        // 2. Disparo sample-accurate (< 1 ms) da Faixa B com silêncio de pré-rolagem exato em frames:
+        //    Inicia ~160 ms antes do downbeat para que ambos os `AVAudioUnitTimePitch` compartilhem o mesmo
+        //    lookahead (~75 ms) e as duas batidas saiam no mainMixerNode coladas no mesmo milissegundo.
         if !hasTriggeredPlayAtFuture {
             let timeUntilMixStart = safeMixStart - t
-            if timeUntilMixStart <= 0.035 {
+            if timeUntilMixStart <= 0.16 {
                 hasTriggeredPlayAtFuture = true
                 postTransitionRecoverDuration = 0
                 ensureRunning()
@@ -855,31 +1084,46 @@ final class AutomixAudioEngine {
                     activeDeck.timePitch.rate = plan.sync.targetRateA
                     incomingDeck.timePitch.rate = plan.sync.initialRateB ?? 1.0
                 }
+
                 let nowHost = mach_absolute_time()
-                let baseHost = activeDeck.playerNode.lastRenderTime?.hostTime ?? nowHost
-                let rate = Double(max(activeDeck.timePitch.rate, 0.5))
-                let wallDelay = max(0, timeUntilMixStart) / rate
-                let futureHost = baseHost + AVAudioTime.hostTime(forSeconds: wallDelay)
-                if futureHost > nowHost + AVAudioTime.hostTime(forSeconds: 0.001) {
-                    incomingDeck.playerNode.play(at: AVAudioTime(hostTime: futureHost))
+                let hostElapsed: Double
+                if let lastHost = activeDeck.playerNode.lastRenderTime?.hostTime, nowHost > lastHost {
+                    hostElapsed = min(AVAudioTime.seconds(forHostTime: nowHost - lastHost), 0.04)
                 } else {
-                    incomingDeck.playerNode.play()
+                    hostElapsed = 0
                 }
-                hasStartedIncoming = true
-                onTransitionStarted?(nextId)
-                reportPhase(.mixing, plan: plan)
-                if isBeatmatch && plan.trackB.bpm > 0 {
-                    reportLiveBPM(plan.trackB.bpm * Double(incomingDeck.timePitch.rate), trend: 0)
-                } else {
-                    reportLiveBPM(nil, trend: 0)
-                }
-                let uiDeck = uiReportingDeck
-                onTimeUpdate?(currentTime(for: uiDeck), uiDeck.fileDuration)
+                let rateA = Double(max(activeDeck.timePitch.rate, 0.5))
+                let rateB = Double(max(incomingDeck.timePitch.rate, 0.5))
+                let wallSecUntilA = max(0.0, timeUntilMixStart / rateA - hostElapsed)
+                let silenceFramesB = Int(round(wallSecUntilA * rateB * Self.renderFormat.sampleRate))
+
+                incomingDeck.prerollSilenceSec = Double(silenceFramesB) / Self.renderFormat.sampleRate
+                _ = incomingDeck.streamer?.commitPendingAndStartStreaming(prerollSilenceFrames: silenceFramesB)
+                incomingDeck.playerNode.play()
+                incomingDeck.isPaused = false
+
+                print(String(format: "[SYNC-LOCK] Preroll disparado | remA=%.1fms hostElap=%.1fms | silenceB=%.1fms (%d fr)",
+                             timeUntilMixStart * 1000.0, hostElapsed * 1000.0,
+                             incomingDeck.prerollSilenceSec * 1000.0, silenceFramesB))
             }
         }
 
+        // 2b. No exato instante em que o silêncio termina e o Beat 1 da Faixa B entra: atualiza UI e fase
+        if hasTriggeredPlayAtFuture && !hasStartedIncoming && t >= safeMixStart - 0.008 {
+            hasStartedIncoming = true
+            onTransitionStarted?(nextId)
+            reportPhase(.mixing, plan: plan)
+            if isBeatmatch && plan.trackB.bpm > 0 {
+                reportLiveBPM(plan.trackB.bpm * Double(incomingDeck.timePitch.rate), trend: 0)
+            } else {
+                reportLiveBPM(nil, trend: 0)
+            }
+            let uiDeck = uiReportingDeck
+            onTimeUpdate?(currentTime(for: uiDeck), uiDeck.fileDuration)
+        }
+
         // 3. Fase da Mixagem Completa: Curva de Volume (Sobrepor) + EQ Central/3-Bandas + Filtros Passa-Alta/Baixa + Reverb
-        if hasStartedIncoming && t >= safeMixStart {
+        if hasStartedIncoming {
             let mixDuration = max(safeMixEnd - safeMixStart, 0.5)
             let p = Float(min(max((t - safeMixStart) / mixDuration, 0.0), 1.0))
             applyTransitionDSP(progress: p, plan: plan, outgoing: activeDeck, incoming: incomingDeck, primeOnlyIncoming: false)
