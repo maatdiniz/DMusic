@@ -41,20 +41,20 @@ nonisolated enum SmartShuffler {
 
         if hasVibe, let cos = vibeCosine(a.vibe, b.vibe) {
             // Modo Vibe-Aware (total 100 pts):
-            //   BPM: 40 pts | Vibe/Timbre: 30 pts | Camelot: 22 pts | Energia: 8 pts
-            let bpmPts = bpmScore(bpmA: a.bpm, bpmB: b.bpm) * (40.0 / 50.0)
-            let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot) * (22.0 / 35.0)
+            //   BPM: 36 pts | Vibe/Clima/Timbre: 36 pts | Camelot: 20 pts | Energia: 8 pts
+            let bpmPts = bpmScore(bpmA: a.bpm, bpmB: b.bpm) * (36.0 / 50.0)
+            let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot) * (20.0 / 35.0)
             let engPts = energyScore(energyA: a.energy, energyB: b.energy) * (8.0 / 15.0)
 
-            // Mapeia cosseno [-0.25 ... +0.92] -> [0 ... 1] com curva suave (favorece mesma atmosfera/timbre)
-            let simNorm = min(1.0, max(0.0, (cos + 0.25) / 1.17))
-            var vibePts = 30.0 * pow(simNorm, 1.35)
-            // Penalidade de choque de clima quando duas faixas pertencem a universos sonoros opostos
-            if cos < 0.15 {
-                let clash = min(1.0, (0.15 - cos) / 0.55)
-                vibePts -= 14.0 * clash
+            // Mapeia cosseno [-0.20 ... +0.92] -> [0 ... 1] com curva que premia fortemente mesma atmosfera/timbre
+            let simNorm = min(1.0, max(0.0, (cos + 0.20) / 1.12))
+            var vibePts = 36.0 * pow(simNorm, 1.40)
+            // Penalidade forte de choque de clima quando duas faixas pertencem a universos sonoros opostos
+            if cos < 0.20 {
+                let clash = min(1.0, (0.20 - cos) / 0.50)
+                vibePts -= 24.0 * clash
             }
-            let genreBonus = sameGenre ? 2.5 : 0.0
+            let genreBonus = sameGenre ? 4.0 : 0.0
             let total = min(100.0, max(0.0, bpmPts + camPts + engPts + vibePts + genreBonus))
             return ScoreBreakdown(
                 bpmPoints: bpmPts,
@@ -69,7 +69,7 @@ nonisolated enum SmartShuffler {
             let bpmPts = bpmScore(bpmA: a.bpm, bpmB: b.bpm)
             let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot)
             let engPts = energyScore(energyA: a.energy, energyB: b.energy)
-            let genreBonus = sameGenre ? 4.0 : 0.0
+            let genreBonus = sameGenre ? 5.0 : 0.0
             let total = min(100.0, bpmPts + camPts + engPts + genreBonus)
             return ScoreBreakdown(
                 bpmPoints: bpmPts,
@@ -88,17 +88,18 @@ nonisolated enum SmartShuffler {
     }
 
     /// Peso máximo: 50 pontos (com Dual-Deck Tempo Bridge aceita até ±15% de diferença de BPM para beatmatch).
+    /// Prefere fortemente mesmo andamento real (1:1) em vez de saltos de metade/dobro do tempo (2:1 / 1:2).
     static func bpmScore(bpmA: Double, bpmB: Double) -> Double {
         guard bpmA > 0, bpmB > 0 else { return 0 }
         let d1 = abs(1.0 - (bpmB / bpmA))
-        let d2 = abs(1.0 - ((bpmB * 2.0) / bpmA))
-        let d3 = abs(1.0 - ((bpmB * 0.5) / bpmA))
+        let d2 = abs(1.0 - ((bpmB * 2.0) / bpmA)) + 0.045
+        let d3 = abs(1.0 - ((bpmB * 0.5) / bpmA)) + 0.045
         let minDiff = min(d1, min(d2, d3))
         let maxAllowedDiff = 0.15
         if minDiff > maxAllowedDiff {
             return 0.0
         }
-        return 50.0 * (1.0 - (minDiff / maxAllowedDiff))
+        return 50.0 * pow(1.0 - (minDiff / maxAllowedDiff), 1.35)
     }
 
     /// Retorna o fator de ajuste alvo (`target_rate_a`) e `initial_rate_b` dividindo grandes diferenças entre os 2 decks.
@@ -403,7 +404,7 @@ nonisolated enum SmartShuffler {
             let lo = lowerBound(ob * 0.92)
             let hi = upperBound(ob * 1.08)
             let neighborCnt = max(1, hi - lo)
-            scarcity[i] = min(12.0, 180.0 / Double(neighborCnt))
+            scarcity[i] = min(5.0, 80.0 / Double(neighborCnt))
         }
 
         let startTime = Date()
@@ -472,11 +473,10 @@ nonisolated enum SmartShuffler {
             for pos in 0..<poolCount {
                 let candIdx = pool[pos]
                 let candMeta = metas[candIdx]
-                let bScore = bpmScore(bpmA: curMeta.bpm, bpmB: candMeta.bpm)
-                let kScore = camelotScore(keyA: curMeta.camelot, keyB: candMeta.camelot)
-                let eScore = energyScore(energyA: curMeta.energy, energyB: candMeta.energy)
-                let raw = bScore + kScore + eScore
-                let eff = raw + (bScore > 10.0 ? scarcity[candIdx] : 0.0)
+                let bd = scoreBreakdown(from: curMeta, to: candMeta)
+                let raw = bd.total
+                let vibeOK = (bd.vibeSimilarity ?? 0.6) >= 0.45
+                let eff = raw + ((bd.bpmPoints >= 18.0 && vibeOK) ? scarcity[candIdx] : 0.0)
 
                 if eff > topEff[activeK - 1] {
                     var ins = activeK - 1
@@ -492,7 +492,12 @@ nonisolated enum SmartShuffler {
                 }
             }
 
-            let pickSlot = Int.random(in: 0..<activeK)
+            // Só sorteia entre candidatos realmente próximos do melhor (dentro de 6 pts) para nunca escolher um choque de clima
+            var eligibleK = 1
+            while eligibleK < activeK && (topEff[0] - topEff[eligibleK]) <= 6.0 {
+                eligibleK += 1
+            }
+            let pickSlot = Int.random(in: 0..<eligibleK)
             let chosenPos = topPos[pickSlot]
             totalRawScore += topRaw[pickSlot]
             current = pool[chosenPos]

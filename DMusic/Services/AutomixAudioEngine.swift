@@ -559,9 +559,9 @@ final class AutomixAudioEngine {
     }
 
     /// Detecta o ataque real da batida/bumbo (kick onset) no PCM decodificado pelo próprio `AVAudioFile`
-    /// numa janela de ±90 ms ao redor do timestamp planejado. Elimina qualquer desvio de priming MP3/AAC
-    /// entre `ffmpeg`/`allin1` e o decoder da Apple. Retorna `targetSec` inalterado em trechos sem percussão clara.
-    private static func snapToNearestBeatOnset(url: URL, targetSec: Double, maxShiftSec: Double = 0.085) -> Double {
+    /// numa janela curta de ±35 ms ao redor do timestamp planejado. Elimina desvio de priming MP3/AAC
+    /// sem jamais pular para uma caixa/contratempo distante. Retorna `targetSec` inalterado sem percussão clara.
+    private static func snapToNearestBeatOnset(url: URL, targetSec: Double, maxShiftSec: Double = 0.035) -> Double {
         guard let file = try? AVAudioFile(forReading: url) else { return targetSec }
         let sr = file.processingFormat.sampleRate
         let totalFrames = file.length
@@ -602,8 +602,8 @@ final class AutomixAudioEngine {
             }
         }
 
-        // Filtro passa-baixa de 1 polo (~220 Hz) para isolar o ataque do bumbo (kick)
-        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 220.0 / sr))
+        // Filtro passa-baixa de 1 polo (~160 Hz) para isolar exclusivamente o ataque do bumbo (kick)
+        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 160.0 / sr))
         var low = [Float](repeating: 0, count: n)
         var y: Float = 0
         for i in 0..<n {
@@ -611,7 +611,7 @@ final class AutomixAudioEngine {
             low[i] = y
         }
 
-        // Energia combinada (70% graves/bumbo + 30% banda larga) em quadros de 5 ms com salto de 2.5 ms
+        // Energia focada no bumbo (85% sub-grave/kick + 15% banda larga) em quadros de 5 ms com salto de 2.5 ms
         let hop = max(1, Int(round(sr * 0.0025)))
         let win = max(hop * 2, Int(round(sr * 0.005)))
         let numFrames = (n - win) / hop
@@ -628,7 +628,7 @@ final class AutomixAudioEngine {
             mono.withUnsafeBufferPointer { ptr in
                 vDSP_rmsqv(ptr.baseAddress! + offset, 1, &rmsFull, vDSP_Length(win))
             }
-            energies[f] = 0.70 * rmsLow + 0.30 * rmsFull
+            energies[f] = 0.85 * rmsLow + 0.15 * rmsFull
         }
 
         // Fluxo de onset positivo (subida súbita de energia = ataque da batida)
@@ -1085,16 +1085,11 @@ final class AutomixAudioEngine {
                     incomingDeck.timePitch.rate = plan.sync.initialRateB ?? 1.0
                 }
 
-                let nowHost = mach_absolute_time()
-                let hostElapsed: Double
-                if let lastHost = activeDeck.playerNode.lastRenderTime?.hostTime, nowHost > lastHost {
-                    hostElapsed = min(AVAudioTime.seconds(forHostTime: nowHost - lastHost), 0.04)
-                } else {
-                    hostElapsed = 0
-                }
                 let rateA = Double(max(activeDeck.timePitch.rate, 0.5))
                 let rateB = Double(max(incomingDeck.timePitch.rate, 0.5))
-                let wallSecUntilA = max(0.0, timeUntilMixStart / rateA - hostElapsed)
+                // Ambos os playerNodes compartilham o mesmo relógio de pull do AVAudioEngine/TimePitch;
+                // não subtrair `hostElapsed` (cujo hostTime atrás do TimePitch defasa ~40 ms no iOS).
+                let wallSecUntilA = max(0.0, timeUntilMixStart / rateA)
                 let silenceFramesB = Int(round(wallSecUntilA * rateB * Self.renderFormat.sampleRate))
 
                 incomingDeck.prerollSilenceSec = Double(silenceFramesB) / Self.renderFormat.sampleRate
@@ -1102,8 +1097,8 @@ final class AutomixAudioEngine {
                 incomingDeck.playerNode.play()
                 incomingDeck.isPaused = false
 
-                print(String(format: "[SYNC-LOCK] Preroll disparado | remA=%.1fms hostElap=%.1fms | silenceB=%.1fms (%d fr)",
-                             timeUntilMixStart * 1000.0, hostElapsed * 1000.0,
+                print(String(format: "[SYNC-LOCK] Preroll disparado | remA=%.1fms | silenceB=%.1fms (%d fr)",
+                             timeUntilMixStart * 1000.0,
                              incomingDeck.prerollSilenceSec * 1000.0, silenceFramesB))
             }
         }
