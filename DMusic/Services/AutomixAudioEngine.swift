@@ -736,11 +736,13 @@ final class AutomixAudioEngine {
     }
 
     /// Agenda o Deck B já posicionado no `entry_sec` (downbeat inicial) pronto para sobreposição + EQ + Filtro DJ.
-    func prepareIncoming(fileB: AVAudioFile, songId: String, plan: TransitionPlan) {
-        guard !hasStartedIncoming, !hasTriggeredPlayAtFuture else { return }
+    /// Retorna o `TransitionPlan` efetivo (já com BeatSnap / ajustes de seek) para manter a barra de progresso 100% sincronizada.
+    @discardableResult
+    func prepareIncoming(fileB: AVAudioFile, songId: String, plan: TransitionPlan) -> TransitionPlan? {
+        guard !hasStartedIncoming, !hasTriggeredPlayAtFuture else { return nil }
         guard Self.canPlay(file: fileB) else {
             clearPreparedIncoming()
-            return
+            return nil
         }
 
         var effectivePlan = plan
@@ -750,7 +752,7 @@ final class AutomixAudioEngine {
             let remaining = durA - now
             guard remaining >= 3.5 else {
                 clearPreparedIncoming()
-                return
+                return nil
             }
             // Mesmo se o usuário pulou para depois do mixStart, preserva o beatmatch (targetRateA/initialRateB)
             // e dispara uma entrada rápida em ~1.2 s em vez de cancelar a sincronia de BPM!
@@ -778,7 +780,7 @@ final class AutomixAudioEngine {
             if let urlA = activeDeck.file?.url, durA > 0, now < origMixStart - 0.5 {
                 let snappedA = Self.snapToNearestBeatOnset(url: urlA, targetSec: origMixStart)
                 let deltaA = snappedA - origMixStart
-                if abs(deltaA) >= 0.002 && abs(deltaA) <= 0.085 {
+                if abs(deltaA) >= 0.002 && abs(deltaA) <= 0.035 {
                     effectivePlan.trackA.mixStartSec = snappedA
                     effectivePlan.trackA.mixEndSec = min(durA - 0.15, effectivePlan.trackA.mixEndSec + deltaA)
                 }
@@ -786,40 +788,27 @@ final class AutomixAudioEngine {
 
             let snappedB = Self.snapToNearestBeatOnset(url: fileB.url, targetSec: origEntryB)
             let deltaB = snappedB - origEntryB
-            if abs(deltaB) >= 0.002 && abs(deltaB) <= 0.085 {
+            if abs(deltaB) >= 0.002 && abs(deltaB) <= 0.035 {
                 effectivePlan.trackB.entrySec = snappedB
             }
 
-            // 2. Alinhamento rápido de BPM: rampa curta de 2–4 compassos + 1 compasso travado antes da entrada
-            //    para que o TimePitch esteja 100% estável em fase antes do disparo do Deck B.
+            // 2. Preserva a rampa variável do plano (calculada conforme a combinação das duas faixas:
+            //    sobe suavemente o BPM com antecedência e mantém tocando no novo ritmo antes de mixar).
+            //    Só adapta a rampa se o usuário já estiver depois de `rampStartSec` (ex.: arrastou a barra).
             let rateDelta = Double(abs(effectivePlan.sync.targetRateA - 1.0))
-            if rateDelta >= 0.003 {
-                let barSec = 4.0 * 60.0 / max(effectivePlan.trackA.bpm, 60.0)
-                let rampBars: Double = rateDelta < 0.020 ? 2.0 : (rateDelta < 0.045 ? 3.0 : 4.0)
-                let holdBars: Double = 1.0
-                let fastRampSec = min(max(rampBars * barSec, 2.5), 9.0)
-                let fastHoldSec = min(max(holdBars * barSec, 1.4), 2.5)
-                let fastLeadSec = fastRampSec + fastHoldSec
-                let desiredRampStart = max(0.0, effectivePlan.trackA.mixStartSec - fastLeadSec)
-                if desiredRampStart > effectivePlan.trackA.rampStartSec {
-                    effectivePlan.trackA.rampStartSec = desiredRampStart
-                    effectivePlan.sync.rampDurationSec = fastRampSec
-                }
-                // Se o usuário já está dentro da janela da rampa (ex.: arrastou a barra para perto do mix),
-                // ajusta a rampa para começar imediatamente de `now` e completar antes da entrada do Deck B!
-                if now > effectivePlan.trackA.rampStartSec && now < effectivePlan.trackA.mixStartSec - 0.25 {
-                    let avail = effectivePlan.trackA.mixStartSec - now
-                    effectivePlan.trackA.rampStartSec = now
-                    effectivePlan.sync.rampDurationSec = max(0.35, min(fastRampSec, avail * 0.72))
-                }
+            if rateDelta >= 0.003,
+               now > effectivePlan.trackA.rampStartSec && now < effectivePlan.trackA.mixStartSec - 0.25 {
+                let avail = effectivePlan.trackA.mixStartSec - now
+                effectivePlan.trackA.rampStartSec = now
+                effectivePlan.sync.rampDurationSec = max(0.35, min(effectivePlan.sync.rampDurationSec, avail * 0.72))
             }
 
             let dAMs = Int(((effectivePlan.trackA.mixStartSec - origMixStart) * 1000.0).rounded())
             let dBMs = Int(((effectivePlan.trackB.entrySec - origEntryB) * 1000.0).rounded())
-            print(String(format: "[SYNC-LOCK] BeatSnap A:%+dms (%.3fs) | B:%+dms (%.3fs) | Ramp:%.1fs→%.1fs | RateA:%.3fx RateB:%.3fx",
+            print(String(format: "[SYNC-LOCK] BeatSnap A:%+dms (%.3fs) | B:%+dms (%.3fs) | Ramp:%.1fs (dur %.1fs)→%.1fs | RateA:%.3fx RateB:%.3fx",
                          dAMs, effectivePlan.trackA.mixStartSec,
                          dBMs, effectivePlan.trackB.entrySec,
-                         effectivePlan.trackA.rampStartSec, effectivePlan.trackA.mixStartSec,
+                         effectivePlan.trackA.rampStartSec, effectivePlan.sync.rampDurationSec, effectivePlan.trackA.mixStartSec,
                          effectivePlan.sync.targetRateA, effectivePlan.sync.initialRateB ?? 1.0))
         }
 
@@ -849,7 +838,7 @@ final class AutomixAudioEngine {
             incoming.songId = nil
             incoming.nominalBPM = 0
             resetTransitionState()
-            return
+            return nil
         }
 
         transitionPlan = effectivePlan
@@ -857,6 +846,7 @@ final class AutomixAudioEngine {
         if isPlaying {
             ensureRunning()
         }
+        return effectivePlan
     }
 
     func clearPreparedIncoming() {
@@ -1190,72 +1180,87 @@ final class AutomixAudioEngine {
             incoming.playerNode.volume = volB
         }
 
-        // 3. ESTILO DE EQ (Troca de Graves no meio da transição / 3 Bandas / Corte Rápido ou Longo)
+        // 3. ESTILO DE EQ (Troca de Graves após a Faixa B atingir intensidade plena; evita cortar médios/agudos junto com filtro!)
         let eqStyle = AutomixEQStyle(rawValue: plan.mix.eqStyle ?? "") ?? .centerBassSwap
-        let cutDb = min(plan.mix.eqSwap.bassCutDb, -20.0) // Garante corte real (-24 dB) mesmo quando antes era fade
-        applyEQ(progress: p, style: eqStyle, cutDb: cutDb, swapCenter: Float(plan.mix.eqSwap.bassSwapAtProgress), outgoing: outgoing, incoming: incoming, primeOnlyIncoming: primeOnlyIncoming)
+        let cutDb = min(plan.mix.eqSwap.bassCutDb, -20.0)
+        let hasOutgoingFilter: Bool = {
+            switch filterStyle {
+            case .none, .lpIn, .hpIn: return false
+            default: return true
+            }
+        }()
+        applyEQ(progress: p, style: eqStyle, cutDb: cutDb, swapCenter: Float(plan.mix.eqSwap.bassSwapAtProgress), hasOutgoingFilter: hasOutgoingFilter, outgoing: outgoing, incoming: incoming, primeOnlyIncoming: primeOnlyIncoming)
 
         // 4. APLICA FILTROS PASSA-ALTA / PASSA-BAIXA + SAÍDA DE RUÍDO FINAL (WASH-OUT)
         applyFilters(progress: p, style: filterStyle, useReverbTail: useReverbTail, outgoing: outgoing, incoming: incoming, primeOnlyIncoming: primeOnlyIncoming)
     }
 
     private func computeVolumes(progress p: Float, curve: AutomixVolumeCurve, filterStyle: AutomixFilterStyle, oneBarFrac: Float) -> (Float, Float) {
-        let isHPFilterExit: Bool = {
+        let hasOutgoingFilter: Bool = {
             switch filterStyle {
-            case .auto, .hpOut, .hpInHpOut, .lpInHpOut, .partialHpOut, .finalNoiseOut: return true
-            default: return false
+            case .none, .lpIn, .hpIn: return false
+            default: return true
             }
         }()
 
         switch curve {
         case .auto, .overlap:
-            // SOBREPOR: Faixa B sobe rápido no 1º quarto (até 0.22).
-            // Quando a Faixa A sai via Passa-Alta, segura 100% de volume até 0.92 (o filtro limpa a faixa sem "abaixar o fader"!).
-            let vB = p < 0.22 ? sin((p / 0.22) * (.pi / 2.0)) : 1.0
-            let holdUntil: Float = isHPFilterExit ? 0.92 : 0.82
-            let vA = p < holdUntil ? 1.0 : cos(((p - holdUntil) / max(1.0 - holdUntil, 0.01)) * (.pi / 2.0))
+            // SOBREPOR (Padrão DJ): Faixa B sobe até 100% na mesma intensidade da A (p: 0..0.28).
+            // Faixa A permanece em 100% de volume durante toda a mixagem (sai via filtro/EQ, nunca murcha no fader!).
+            // Micro-rampa anti-pop de apenas 4% no finalzinho (0.96..1.0) para desligar o Deck A sem clique.
+            let vB = p < 0.28 ? sin((p / 0.28) * (.pi / 2.0)) : 1.0
+            let vA: Float = p < 0.96 ? 1.0 : cos(((p - 0.96) / 0.04) * (.pi / 2.0))
             return (vA, vB)
 
         case .smoothCrossfade:
-            // Fade cruzado suave (Equal-power cos/sin)
-            return (cos(p * .pi / 2.0), sin(p * .pi / 2.0))
+            // Último caso (fade cruzado): só reduz volume da A se não houver filtro de saída ativo
+            let vB = sin(p * .pi / 2.0)
+            let vA: Float = hasOutgoingFilter
+                ? (p < 0.94 ? 1.0 : cos(((p - 0.94) / 0.06) * (.pi / 2.0)))
+                : (p < 0.55 ? 1.0 : cos(((p - 0.55) / 0.45) * (.pi / 2.0)))
+            return (vA, vB)
 
         case .fadeInFadeOut:
-            // Fade in / Fade out linear simétrico
-            return (1.0 - p, p)
+            let vB = min(p / 0.35, 1.0)
+            let vA: Float = hasOutgoingFilter
+                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
+                : (p < 0.55 ? 1.0 : max(0.0, 1.0 - ((p - 0.55) / 0.45)))
+            return (vA, vB)
 
         case .cutInFadeOut:
-            // Corte na entrada (B entra direto a 100% no Beat 1) com fade out na A a partir do meio
+            // B entra direta a 100% no Beat 1; A segura 100% até o filtro agir (só abaixa volume se não tiver filtro)
             let r = min(p / 0.025, 1.0)
-            let vA = p < 0.35 ? 1.0 : max(0.0, 1.0 - ((p - 0.35) / 0.65))
+            let vA: Float = hasOutgoingFilter
+                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
+                : (p < 0.60 ? 1.0 : max(0.0, 1.0 - ((p - 0.60) / 0.40)))
             return (vA, r)
 
         case .fadeInCutOut:
-            // Fade in na B enquanto A segura 100% até o corte seco no final da frase
-            let vB = min(p / 0.75, 1.0)
-            let vA: Float = p < 0.95 ? 1.0 : max(0.0, 1.0 - ((p - 0.95) / 0.05))
+            // B sobe até 100% em intensidade igual à A (0..0.40); A segura 100% até o corte seco no fim da frase
+            let vB = min(p / 0.40, 1.0)
+            let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
             return (vA, vB)
 
         case .centerCut:
-            // Corte central: A e B se encontram no meio (50%) e A corta exatamente na virada central do compasso
-            let vB = p < 0.50 ? min(p / 0.45, 1.0) : 1.0
-            let vA: Float = p < 0.50 ? 1.0 : max(0.0, 1.0 - ((p - 0.50) / 0.05))
+            // Corte central: B chega a 100% antes do meio e A corta limpo na virada central do compasso
+            let vB = p < 0.45 ? min(p / 0.40, 1.0) : 1.0
+            let vA: Float = p < 0.50 ? 1.0 : max(0.0, 1.0 - ((p - 0.50) / 0.04))
             return (vA, vB)
 
         case .crossfadeQuickOut:
-            // Fade in com saída rápida: B sobe até 0.55; A segura 100% até 0.55 e sai rápido
-            let vB = min(p / 0.55, 1.0)
-            let vA = p < 0.55 ? 1.0 : max(0.0, 1.0 - ((p - 0.55) / 0.45))
+            // B atinge 100% até 0.35; A segura 100% até o final quando há filtro (sem abaixar volume antes da hora)
+            let vB = min(p / 0.35, 1.0)
+            let vA: Float = hasOutgoingFilter
+                ? (p < 0.94 ? 1.0 : max(0.0, 1.0 - ((p - 0.94) / 0.06)))
+                : (p < 0.65 ? 1.0 : max(0.0, 1.0 - ((p - 0.65) / 0.35)))
             return (vA, vB)
 
         case .fadeIn1BarCutOut:
-            // Fade in de 1 compasso na B + sobreposição total + corte na saída da A
             let vB = min(p / oneBarFrac, 1.0)
-            let vA: Float = p < 0.95 ? 1.0 : max(0.0, 1.0 - ((p - 0.95) / 0.05))
+            let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
             return (vA, vB)
 
         case .overlap1BarCutOut:
-            // Sobreposição pura no último compasso com corte seco na saída
             let startB = max(0.0, 1.0 - oneBarFrac)
             let vB: Float = p < startB ? 0.0 : min((p - startB) / 0.025, 1.0)
             let vA: Float = p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04))
@@ -1268,6 +1273,7 @@ final class AutomixAudioEngine {
         style: AutomixEQStyle,
         cutDb: Float,
         swapCenter: Float,
+        hasOutgoingFilter: Bool,
         outgoing: DeckChannel,
         incoming: DeckChannel,
         primeOnlyIncoming: Bool
@@ -1329,27 +1335,29 @@ final class AutomixAudioEngine {
             inBands[2].gain = 0.0
 
         case .threeBandTransition:
-            // Transição completa de 3 Bandas tipo Mixer DJ (Isolator Low -> Mid -> High escalonados):
-            // 1º: Agudos da B entram (0.05..0.35) e Agudos da A recuam no fim (0.65..0.95)
-            // 2º: Graves trocam de golpe no centro (0.44..0.56)
-            // 3º: Médios/Vocais trocam logo após o centro (0.45..0.78) evitando choque vocal durante a sobreposição!
-            let lowS = min(max((p - 0.44) / 0.12, 0.0), 1.0)
-            let midInS = min(max((p - 0.25) / 0.45, 0.0), 1.0)
-            let midOutS = min(max((p - 0.48) / 0.38, 0.0), 1.0)
-            let highInS = min(max((p - 0.05) / 0.30, 0.0), 1.0)
-            let highOutS = min(max((p - 0.65) / 0.30, 0.0), 1.0)
+            // Transição de 3 Bandas tipo Mixer DJ:
+            // 1º: Agudos e Médios da B sobem cedo para acompanhar a A na mesma intensidade
+            // 2º: Graves trocam de golpe após a B já estar presente (0.48..0.58)
+            // 3º: Se já houver filtro na saída da A, evita empilhar corte de -15 dB em médios/agudos para a A não ficar muda!
+            let lowS = min(max((p - 0.48) / 0.10, 0.0), 1.0)
+            let midInS = min(max((p - 0.18) / 0.35, 0.0), 1.0)
+            let midOutS = min(max((p - 0.58) / 0.35, 0.0), 1.0)
+            let highInS = min(max((p - 0.04) / 0.25, 0.0), 1.0)
+            let highOutS = min(max((p - 0.72) / 0.26, 0.0), 1.0)
 
-            let midCut: Float = -15.0
-            let highCut: Float = -14.0
+            let midCutIn: Float = -12.0
+            let highCutIn: Float = -10.0
+            let midCutOut: Float = hasOutgoingFilter ? -5.0 : -14.0
+            let highCutOut: Float = hasOutgoingFilter ? 0.0 : -12.0
 
             if !primeOnlyIncoming {
                 outBands[0].gain = cutDb * lowS
-                outBands[1].gain = midCut * midOutS
-                outBands[2].gain = highCut * highOutS
+                outBands[1].gain = midCutOut * midOutS
+                outBands[2].gain = highCutOut * highOutS
             }
             inBands[0].gain = cutDb * (1.0 - lowS)
-            inBands[1].gain = midCut * (1.0 - midInS)
-            inBands[2].gain = highCut * (1.0 - highInS)
+            inBands[1].gain = midCutIn * (1.0 - midInS)
+            inBands[2].gain = highCutIn * (1.0 - highInS)
         }
     }
 
@@ -1377,55 +1385,55 @@ final class AutomixAudioEngine {
         var inHP: Float? = nil
         var inLP: Float? = nil
 
-        // Na entrada (B): o filtro atua na 1ª metade (p: 0.0 -> 0.52) abrindo exatamente no drop/troca central
-        let inSweep = min(max(p / 0.52, 0.0), 1.0)
-        // Na saída (A): o filtro começa a varrer a partir do meio da transição (p: 0.45 -> 1.0)
-        let outSweep = min(max((p - 0.45) / 0.55, 0.0), 1.0)
+        // Na entrada (B): o filtro abre rápido até p = 0.42 para a batida da B acompanhar a A na mesma intensidade
+        let inSweep = min(max(p / 0.42, 0.0), 1.0)
+        // Na saída (A): o filtro SÓ começa a atuar em p = 0.58, depois da B já estar cheia e com o grave trocado!
+        let outSweep = min(max((p - 0.58) / 0.42, 0.0), 1.0)
 
         switch style {
         case .none:
             break
 
         case .lpOut:
-            // Passa-baixa na saída (abafa a Faixa A de 18 kHz até 280 Hz na saída)
-            outLP = expFreq(from: 18_000, to: 280, t: outSweep)
+            // Passa-baixa na saída (abafa a Faixa A de 18 kHz até 380 Hz na saída)
+            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
 
         case .lpIn:
-            // Passa-baixa na entrada (Faixa B surge abafada de 320 Hz abrindo até 18 kHz no meio)
-            inLP = expFreq(from: 320, to: 18_000, t: inSweep)
+            // Passa-baixa na entrada (Faixa B surge de 380 Hz abrindo até 18 kHz antes do meio)
+            inLP = expFreq(from: 380, to: 18_000, t: inSweep)
 
         case .lpInLpOut:
-            inLP = expFreq(from: 320, to: 18_000, t: inSweep)
-            outLP = expFreq(from: 18_000, to: 280, t: outSweep)
+            inLP = expFreq(from: 380, to: 18_000, t: inSweep)
+            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
 
         case .lpInHpOut:
-            inLP = expFreq(from: 320, to: 18_000, t: inSweep)
-            outHP = expFreq(from: 25, to: 2_600, t: outSweep)
+            inLP = expFreq(from: 380, to: 18_000, t: inSweep)
+            outHP = expFreq(from: 25, to: 2_000, t: outSweep)
 
         case .hpOut:
-            // Passa-alta na saída (Faixa A mantém volume cheio e afina de 25 Hz até 3400 Hz na metade final)
-            outHP = expFreq(from: 25, to: 3_400, t: outSweep)
+            // Passa-alta na saída (Faixa A mantém volume cheio e afina de 25 Hz até 2200 Hz após a B assumir)
+            outHP = expFreq(from: 25, to: 2_200, t: outSweep)
 
         case .hpIn:
-            // Passa-alta na entrada (Faixa B entra sem peso em 1400 Hz e desce até 20 Hz no drop central)
-            inHP = expFreq(from: 1_400, to: 20, t: inSweep)
+            // Passa-alta na entrada (Faixa B entra limpa em 1100 Hz e desce até 20 Hz antes do meio)
+            inHP = expFreq(from: 1_100, to: 20, t: inSweep)
 
         case .auto, .hpInHpOut:
-            inHP = expFreq(from: 1_200, to: 20, t: inSweep)
-            outHP = expFreq(from: 25, to: 3_200, t: outSweep)
+            inHP = expFreq(from: 1_000, to: 20, t: inSweep)
+            outHP = expFreq(from: 25, to: 2_200, t: outSweep)
 
         case .hpInLpOut:
-            inHP = expFreq(from: 1_200, to: 20, t: inSweep)
-            outLP = expFreq(from: 18_000, to: 300, t: outSweep)
+            inHP = expFreq(from: 1_000, to: 20, t: inSweep)
+            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
 
         case .partialHpOut:
-            // Passa-alta parcial na saída (tira o corpo/médio-grave da A até 750 Hz mantendo os vocais/hi-hats limpos)
-            outHP = expFreq(from: 25, to: 750, t: outSweep)
+            // Passa-alta parcial na saída (tira o corpo/médio-grave da A até 680 Hz mantendo vocais/hi-hats limpos)
+            outHP = expFreq(from: 25, to: 680, t: outSweep)
 
         case .finalNoiseOut:
-            // Saída de ruído final / Wash-out (High-Pass agressivo até 3.4 kHz + cauda espacial de Reverb Hall)
-            outHP = expFreq(from: 25, to: 3_400, t: outSweep)
-            inHP = expFreq(from: 900, to: 20, t: inSweep)
+            // Saída de ruído final / Wash-out (High-Pass até 2.4 kHz + cauda espacial de Reverb Hall)
+            outHP = expFreq(from: 25, to: 2_400, t: outSweep)
+            inHP = expFreq(from: 800, to: 20, t: inSweep)
         }
 
         if !primeOnlyIncoming {

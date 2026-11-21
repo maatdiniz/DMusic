@@ -1200,41 +1200,44 @@ private struct DJScrubberSlider: View {
             let zone = rampZone
 
             ZStack(alignment: .leading) {
-                // Trilho base
-                Capsule(style: .continuous)
-                    .fill(Color.white.opacity(0.18))
-                    .frame(width: w, height: trackH)
+                // Trilho base + trechos de rampa/hold de BPM + progresso branco, todos recortados no Capsule exato
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.18))
+                        .frame(width: w, height: trackH)
 
-                // Trecho de mudança de BPM + trecho em cinza claro onde mantém o novo BPM
-                if let zone {
-                    let zoneX = w * zone.startFrac
-                    if let holdFrac = zone.holdStartFrac {
-                        let holdX = w * holdFrac
-                        let rampW = max(0, holdX - zoneX)
-                        let holdW = max(0, w - holdX)
+                    if let zone {
+                        let zoneX = w * zone.startFrac
+                        if let holdFrac = zone.holdStartFrac {
+                            let holdX = w * holdFrac
+                            let rampW = max(0, holdX - zoneX)
+                            let holdW = max(0, w - holdX)
 
-                        Rectangle()
-                            .fill(zone.color.opacity(0.65))
-                            .frame(width: rampW, height: trackH)
-                            .offset(x: zoneX)
+                            Rectangle()
+                                .fill(zone.color.opacity(0.70))
+                                .frame(width: rampW, height: trackH)
+                                .offset(x: zoneX)
 
-                        Capsule(style: .continuous)
-                            .fill(Color.white.opacity(0.42))
-                            .frame(width: holdW, height: trackH)
-                            .offset(x: holdX)
-                    } else {
-                        let zoneW = max(0, w - zoneX)
-                        Capsule(style: .continuous)
-                            .fill(zone.color.opacity(0.65))
-                            .frame(width: zoneW, height: trackH)
-                            .offset(x: zoneX)
+                            Rectangle()
+                                .fill(Color.white.opacity(0.45))
+                                .frame(width: holdW, height: trackH)
+                                .offset(x: holdX)
+                        } else {
+                            let zoneW = max(0, w - zoneX)
+                            Rectangle()
+                                .fill(zone.color.opacity(0.70))
+                                .frame(width: zoneW, height: trackH)
+                                .offset(x: zoneX)
+                        }
                     }
-                }
 
-                // Progresso percorrido sempre em branco (sem pintar a barra toda da cor do final)
-                Capsule(style: .continuous)
-                    .fill(Color.white)
-                    .frame(width: max(trackH, fillW), height: trackH)
+                    // Progresso percorrido sempre em branco
+                    Rectangle()
+                        .fill(Color.white)
+                        .frame(width: max(0, fillW), height: trackH)
+                }
+                .frame(width: w, height: trackH)
+                .clipShape(Capsule(style: .continuous))
 
                 // Thumb (bolinha do slider) sempre branco
                 Circle()

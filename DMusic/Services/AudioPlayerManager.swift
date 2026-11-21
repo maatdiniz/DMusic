@@ -347,6 +347,9 @@ final class AudioPlayerManager {
                 let badge = Self.activeMixingBadge(for: plan)
                 self.automixPhaseLabel = badge.text
                 self.automixBadge = badge
+                // Deck B já assumiu a barra de progresso — limpa o plano da Faixa A para não desenhar
+                // a zona colorida de rampa da faixa anterior sobre a barra da nova faixa.
+                self.activeTransitionPlan = nil
                 if let p = plan {
                     let vol = AutomixVolumeCurve(rawValue: p.mix.volumeCurve ?? "")?.title ?? "Sobrepor"
                     let eq = AutomixEQStyle(rawValue: p.mix.eqStyle ?? "")?.title ?? "Troca de Grave central"
@@ -543,10 +546,11 @@ final class AudioPlayerManager {
 
     // MARK: Regras do Automix vs Gapless
 
-    /// Álbuns ouvidos na sequência original mantêm Gapless puro; playlists, shuffle e listas usam Automix quando ativado.
+    /// Álbuns ouvidos na sequência original mantêm Gapless puro; playlists, shuffle, listas
+    /// e músicas inseridas manualmente na fila ("Tocar a seguir") usam Automix quando ativado.
     var shouldUseAutomix: Bool {
         guard automixEnabled, !sleepAtEndOfTrack else { return false }
-        if !shuffle, case .album = effectivePlaybackSource {
+        if !shuffle, priorityCount == 0, case .album = effectivePlaybackSource {
             return false
         }
         return true
@@ -1055,30 +1059,30 @@ final class AudioPlayerManager {
             _ = await ImageCache.shared.image(id: coverB, size: 600, client: client)
         }
         guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
-        automixEngine.prepareIncoming(fileB: fileB, songId: songB.id, plan: plan)
-        activeTransitionPlan = plan
+        let resolvedPlan = automixEngine.prepareIncoming(fileB: fileB, songId: songB.id, plan: plan) ?? plan
+        activeTransitionPlan = resolvedPlan
 
-        let outStr = Self.formatMMSS(plan.trackA.mixStartSec)
-        let inStr = Self.formatMMSS(plan.trackB.entrySec)
-        let tag = (plan.source == "allin1") ? "MIX IA" : "MIX LOCAL"
-        let barsTxt = plan.mix.bars.map { "\($0)c" } ?? ""
-        let volShort = AutomixVolumeCurve(rawValue: plan.mix.volumeCurve ?? "")?.shortLabel ?? "SOBREPOR"
-        let eqShort = AutomixEQStyle(rawValue: plan.mix.eqStyle ?? "")?.shortLabel ?? "EQ CENTRAL"
-        let fltShort = AutomixFilterStyle(rawValue: plan.mix.filterStyle ?? "")?.shortLabel ?? ""
+        let outStr = Self.formatMMSS(resolvedPlan.trackA.mixStartSec)
+        let inStr = Self.formatMMSS(resolvedPlan.trackB.entrySec)
+        let tag = (resolvedPlan.source == "allin1") ? "MIX IA" : "MIX LOCAL"
+        let barsTxt = resolvedPlan.mix.bars.map { "\($0)c" } ?? ""
+        let volShort = AutomixVolumeCurve(rawValue: resolvedPlan.mix.volumeCurve ?? "")?.shortLabel ?? "SOBREPOR"
+        let eqShort = AutomixEQStyle(rawValue: resolvedPlan.mix.eqStyle ?? "")?.shortLabel ?? "EQ CENTRAL"
+        let fltShort = AutomixFilterStyle(rawValue: resolvedPlan.mix.filterStyle ?? "")?.shortLabel ?? ""
         let fxSummary = fltShort.isEmpty ? "\(volShort) • \(eqShort)" : "\(volShort) • \(eqShort) • \(fltShort)"
         preparedMixHint = "\(tag) (\(barsTxt)) • \(outStr)→\(inStr) • \(fxSummary)"
 
         // Badge armado discreto (mostra direção prevista do BPM quando em espera)
         if !isAutomixing {
-            let r = plan.sync.targetRateA
+            let r = resolvedPlan.sync.targetRateA
             let icon = r > 1.003 ? "arrowtriangle.up.fill" : (r < 0.997 ? "arrowtriangle.down.fill" : "waveform")
             automixBadge = AutomixIndicatorBadge(text: "SINC \(outStr)", icon: icon, kind: .armed)
         }
 
         logEvent(
-            plan.source == "allin1" ? .server : .engine,
+            resolvedPlan.source == "allin1" ? .server : .engine,
             "Plano armado: \(songA.title) → \(songB.title)",
-            detail: "\(tag) (\(plan.mix.bars ?? 8) comp.) | Saída \(outStr) [\(plan.trackA.section ?? "inst")] → Entrada \(inStr) [\(plan.trackB.section ?? "drop")] | Rate A: \(String(format: "%.3fx", plan.sync.targetRateA)) • Rate B: \(String(format: "%.3fx", plan.sync.initialRateB ?? 1.0)) | \(fxSummary)"
+            detail: "\(tag) (\(resolvedPlan.mix.bars ?? 8) comp.) | Saída \(outStr) [\(resolvedPlan.trackA.section ?? "inst")] → Entrada \(inStr) [\(resolvedPlan.trackB.section ?? "drop")] | Rate A: \(String(format: "%.3fx", resolvedPlan.sync.targetRateA)) • Rate B: \(String(format: "%.3fx", resolvedPlan.sync.initialRateB ?? 1.0)) | \(fxSummary)"
         )
     }
 
@@ -1216,8 +1220,8 @@ final class AudioPlayerManager {
                    let localB = localFileURL(for: nextSong.id),
                    let fileB = try? AVAudioFile(forReading: localB),
                    AutomixAudioEngine.canPlay(file: fileB) {
-                    automixEngine.prepareIncoming(fileB: fileB, songId: nextSong.id, plan: plan)
-                    activeTransitionPlan = plan
+                    let resolvedPlan = automixEngine.prepareIncoming(fileB: fileB, songId: nextSong.id, plan: plan) ?? plan
+                    activeTransitionPlan = resolvedPlan
                 } else {
                     preparedMixHint = nil
                     activeTransitionPlan = nil
@@ -1333,6 +1337,7 @@ final class AudioPlayerManager {
         guard currentSong != nil else { play(songs: [song]); return }
         queue.insert(song, at: currentIndex + 1)
         priorityCount += 1
+        promoteToEngineForQueuedMixIfNeeded()
         queueChanged()
     }
 
@@ -1340,7 +1345,40 @@ final class AudioPlayerManager {
         guard currentSong != nil else { play(songs: [song]); return }
         queue.append(song)
         if !originalQueue.isEmpty { originalQueue.append(song) }
+        // Se a faixa recém-adicionada virou a próxima imediata (ex.: fila só tinha 1 música), tenta mixar
+        if currentIndex + 1 == queue.count - 1 {
+            promoteToEngineForQueuedMixIfNeeded()
+        }
         queueChanged()
+    }
+
+    /// Se o Automix estiver ligado mas a faixa atual estiver tocando em Gapless (ex.: álbum sem shuffle ou stream),
+    /// promove a faixa atual para o motor Dual-Deck no tempo exato para tentar mixar a faixa inserida na fila.
+    private func promoteToEngineForQueuedMixIfNeeded() {
+        guard shouldUseAutomix, !usingEngineMode, let cur = currentSong else { return }
+        if let localURL = localFileURL(for: cur.id),
+           let audioFile = try? AVAudioFile(forReading: localURL),
+           AutomixAudioEngine.canPlay(file: audioFile) {
+            let resumeSec = max(0, currentTime)
+            let wasPlaying = isPlaying
+            gaplessPlayer.pause()
+            gaplessPlayer.removeAllItems()
+            itemIndex = [:]
+            activeItem = nil
+            usingEngineMode = true
+            automixEngine.volumeCompensation = settings?.volumeCompensation ?? .off
+            automixEngine.startPlaying(file: audioFile, songId: cur.id, startAtSec: resumeSec, autoplay: wasPlaying)
+        } else {
+            // Ainda não está em cache local: baixa em segundo plano e promove assim que disponível
+            let curId = cur.id
+            Task { [weak self] in
+                guard let self else { return }
+                await self.recents?.cache(cur, protecting: [curId], forceForAutomix: true)
+                guard self.currentSong?.id == curId, self.shouldUseAutomix, !self.usingEngineMode else { return }
+                self.promoteToEngineForQueuedMixIfNeeded()
+                self.queueChanged()
+            }
+        }
     }
 
     func jump(to index: Int) {

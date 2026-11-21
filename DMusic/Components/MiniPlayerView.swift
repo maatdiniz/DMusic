@@ -7,7 +7,8 @@ struct MiniPlayerView: View {
 
     var body: some View {
         if let song = player.currentSong {
-            let progress = player.duration > 0 ? min(max(player.currentTime / player.duration, 0), 1) : 0
+            let maxTime = max(player.effectiveScrubberEndTime, 1.0)
+            let progress = min(max(player.currentTime / maxTime, 0), 1)
             VStack(spacing: 0) {
                 HStack(spacing: 12) {
                     CoverArtView(coverArt: song.coverArt, size: 100, cornerRadius: 7)
