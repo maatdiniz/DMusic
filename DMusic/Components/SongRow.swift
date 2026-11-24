@@ -53,13 +53,16 @@ struct SongRow: View {
     var leading: Leading = .number
     var djContextSongs: [Song] = []
     var djContextSource: PlaybackSource? = nil
+    /// Toque simples (tocar a faixa). A pressão longa abre o menu de ações.
+    /// Fica antes de `onRemoveFromPlaylist` para o fechamento solto `SongRow(...) { }` ser sempre este.
+    var onPlay: (() -> Void)? = nil
     var onRemoveFromPlaylist: (() -> Void)? = nil
     enum Leading { case number, cover }
     @Environment(AudioPlayerManager.self) private var player
     @Environment(DownloadManager.self) private var downloads
     @Environment(FavoritesStore.self) private var favorites
     @Environment(TrackAnalysisStore.self) private var analysisStore
-    @State private var showAddToPlaylist = false
+    @State private var isPressed = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -103,42 +106,76 @@ struct SongRow: View {
                 .frame(minWidth: 38, alignment: .trailing)
         }
         .contentShape(Rectangle())
-        .sheet(isPresented: $showAddToPlaylist) { AddToPlaylistSheet(songs: [song]) }
-        .contextMenu {
-            if djContextSongs.count > 1 {
-                Button {
-                    player.startDJMix(startingWith: song, in: djContextSongs, source: djContextSource)
-                } label: {
-                    Label(djLocalLabel, systemImage: "waveform.path.ecg")
-                }
-            }
-            Button {
-                Task { await player.startFullLibraryDJMix(startingWith: song) }
-            } label: {
-                Label("Mix DJ (Todas as músicas)", systemImage: "dot.radiowaves.left.and.right")
-            }
-            Divider()
-            Button { player.playNext(song) } label: { Label("Tocar a seguir", systemImage: "text.insert") }
-            Button { player.addToQueue(song) } label: { Label("Adicionar à fila", systemImage: "text.append") }
-            Button { favorites.toggle(song) } label: {
-                Label(favorites.isFavorite(song.id) ? "Remover dos favoritos" : "Favoritar",
-                      systemImage: favorites.isFavorite(song.id) ? "heart.slash" : "heart")
-            }
-            Button { showAddToPlaylist = true } label: { Label("Adicionar à playlist", systemImage: "music.note.list") }
-            Button { player.navigateToSongArtist(song) } label: { Label("Ir para o Artista", systemImage: "music.mic") }
-            Button { player.navigateToSongAlbum(song) } label: { Label("Ir para o Álbum", systemImage: "square.stack") }
-            if downloads.isDownloaded(song.id) {
-                Button(role: .destructive) { downloads.remove(song) } label: { Label("Remover download", systemImage: "trash") }
-            } else {
-                Button { Task { await downloads.download(song) } } label: { Label("Baixar", systemImage: "arrow.down.circle") }
-            }
-            if let onRemoveFromPlaylist {
-                Divider()
-                Button(role: .destructive, action: onRemoveFromPlaylist) {
-                    Label("Remover da playlist", systemImage: "minus.circle")
-                }
-            }
+        .opacity(isPressed ? 0.55 : 1)
+        .scaleEffect(isPressed ? 0.985 : 1)
+        .animation(.easeOut(duration: 0.14), value: isPressed)
+        .onTapGesture { onPlay?() }
+        .onLongPressGesture(minimumDuration: 0.34, maximumDistance: 14) {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            presentMenu()
+        } onPressingChanged: { pressing in
+            isPressed = pressing
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(named: "Mais opções") { presentMenu() }
+    }
+
+    // MARK: Menu de ações
+
+    private func presentMenu() {
+        let song = self.song
+        let player = self.player
+        let favorites = self.favorites
+        let downloads = self.downloads
+        let isFav = favorites.isFavorite(song.id)
+        let isDownloaded = downloads.isDownloaded(song.id)
+
+        var mix: [ActionMenuItem] = []
+        if djContextSongs.count > 1 {
+            let context = djContextSongs
+            let source = djContextSource
+            mix.append(ActionMenuItem(title: djLocalLabel, subtitle: "Automix a partir desta faixa", systemImage: "waveform.path.ecg", style: .accent) {
+                player.startDJMix(startingWith: song, in: context, source: source)
+            })
+        }
+        mix.append(ActionMenuItem(title: "Mix DJ com toda a biblioteca", subtitle: "Busca todas as músicas do servidor", systemImage: "dot.radiowaves.left.and.right", style: .accent) {
+            Task { await player.startFullLibraryDJMix(startingWith: song) }
+        })
+
+        let queue: [ActionMenuItem] = [
+            ActionMenuItem(title: "Tocar a seguir", systemImage: "text.insert") { player.playNext(song) },
+            ActionMenuItem(title: "Adicionar à fila", systemImage: "text.append") { player.addToQueue(song) },
+            ActionMenuItem(title: isFav ? "Remover dos favoritos" : "Favoritar", systemImage: isFav ? "heart.slash" : "heart") { favorites.toggle(song) },
+            ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: [song]) },
+        ]
+
+        let goTo: [ActionMenuItem] = [
+            ActionMenuItem(title: "Ir para o artista", systemImage: "music.mic") { player.navigateToSongArtist(song) },
+            ActionMenuItem(title: "Ir para o álbum", systemImage: "square.stack") { player.navigateToSongAlbum(song) },
+            isDownloaded
+                ? ActionMenuItem(title: "Remover download", systemImage: "trash", style: .destructive) { downloads.remove(song) }
+                : ActionMenuItem(title: "Baixar", systemImage: "arrow.down.circle") { Task { await downloads.download(song) } },
+        ]
+
+        var sections = [mix, queue, goTo]
+        if let onRemoveFromPlaylist {
+            sections.append([ActionMenuItem(title: "Remover da playlist", systemImage: "minus.circle", style: .destructive, action: onRemoveFromPlaylist)])
+        }
+
+        var badges: [String] = []
+        if let q = song.qualityText { badges.append(q) }
+        if let meta = analysisStore.metadata(for: song.id) { badges.append("\(meta.formattedBPM) BPM"); badges.append(meta.camelot) }
+
+        player.actionMenu = ActionMenuRequest(
+            header: ActionMenuHeader(
+                title: song.title,
+                subtitle: ArtistParser.displayString(for: song),
+                coverArt: song.coverArt,
+                badges: badges
+            ),
+            sections: sections
+        )
     }
 
     private var djLocalLabel: String {

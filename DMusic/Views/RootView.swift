@@ -21,10 +21,10 @@ struct RootView: View {
                 Task {
                     await scrobbler.flush()
                     await favorites.load()
-                    if let mc = player.mixClient { await analysisStore.syncFromServer(mixClient: mc) }
+                    await analysisStore.syncFromServerIfStale(mixClient: player.mixClient)
                 }
             }
-            if phase == .background { player.saveState() }
+            if phase == .background { player.saveState(blocking: true) }
         }
         .onAppear { AppServices.shared.syncClient() }
         .onChange(of: auth.client?.serverURL) { _, _ in

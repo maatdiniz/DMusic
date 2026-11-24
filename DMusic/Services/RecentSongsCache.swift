@@ -40,6 +40,21 @@ final class RecentSongsCache {
         entries.first { $0.song.id == id }.map { dir.appendingPathComponent($0.fileName) }
     }
 
+    /// Remove do cache uma faixa cujo arquivo não pode ser usado (ex.: corrompido), para ser baixada novamente.
+    func evict(id: String) {
+        guard let e = entries.first(where: { $0.song.id == id }) else { return }
+        remove(e)
+        save()
+    }
+
+    /// `true` quando o arquivo está vazio ou os primeiros 64 KB são só zeros (sem cabeçalho de áudio).
+    nonisolated static func isCorruptAudioFile(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return true }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 64 * 1024), !head.isEmpty else { return true }
+        return !head.contains { $0 != 0 }
+    }
+
     func touch(_ id: String) {
         guard let i = entries.firstIndex(where: { $0.song.id == id }) else { return }
         entries[i].lastPlayed = Date()
@@ -72,6 +87,12 @@ final class RecentSongsCache {
                 let dest = self.dir.appendingPathComponent(name)
                 try? FileManager.default.removeItem(at: dest)
                 try FileManager.default.moveItem(at: tmp, to: dest)
+                // Descarta downloads corrompidos (ex.: arquivo do tamanho certo mas todo zerado) para não envenenar o cache
+                if Self.isCorruptAudioFile(dest) {
+                    try? FileManager.default.removeItem(at: dest)
+                    print("[CACHE] Download corrompido descartado: \(song.title) (\(name))")
+                    return
+                }
                 let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(Int64.init) ?? 0
                 if self.localURL(for: song.id) == nil {
                     self.entries.append(RecentEntry(song: song, fileName: name, lastPlayed: Date(), size: size))

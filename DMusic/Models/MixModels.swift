@@ -228,7 +228,7 @@ nonisolated enum AutomixFilterStyle: String, Codable, CaseIterable, Identifiable
     }
 }
 
-// MARK: - Indicador Discreto de SINC / MIX e Logs do Sistema & Smart Shuffle
+// MARK: - Indicador Discreto de SYNC / MIX e Logs do Sistema & Smart Shuffle
 
 nonisolated enum DJStageMode: Equatable, Sendable {
     case idle       // Capa normal (currentSong)
@@ -240,9 +240,9 @@ nonisolated enum DJStageMode: Equatable, Sendable {
 nonisolated struct AutomixIndicatorBadge: Equatable, Sendable {
     enum Kind: String, Equatable, Sendable {
         case armed          // Transição armada / aguardando
-        case syncUp         // Aumentando BPM (SINC ↑)
-        case syncDown       // Abaixando BPM (SINC ↓)
-        case syncSteady     // BPM já cravado (SINC •)
+        case syncUp         // Aumentando BPM (SYNC ↑)
+        case syncDown       // Abaixando BPM (SYNC ↓)
+        case syncSteady     // BPM já cravado (SYNC •)
         case mixOverlap     // Mixando com Sobrepor + EQ Central
         case mixThreeBand   // Mixando com EQ 3 Bandas
         case mixQuickCut    // Mixando com Corte / Saída Rápida
@@ -292,7 +292,7 @@ nonisolated struct SmartShuffleRunLog: Identifiable, Hashable, Sendable {
 nonisolated struct AutomixEventLog: Identifiable, Hashable, Sendable {
     enum Category: String, Sendable {
         case shuffle = "SHUFFLE"
-        case sync = "SINC"
+        case sync = "SYNC"
         case mix = "MIX"
         case engine = "ENGINE"
         case server = "SERVIDOR"

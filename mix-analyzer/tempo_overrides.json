@@ -1,0 +1,9 @@
+{
+  "overrides": [
+    {
+      "match": "(2024) TRAFUGA 001/09. 2AT - DIS BONGO MAKES ME WANNA DIE YOUNG",
+      "factor": 2,
+      "note": "Semicolcheias rolando: o pulso medido é 115, mas o andamento sentido é 230 BPM (confirmado ao ouvir)."
+    }
+  ]
+}

@@ -250,9 +250,10 @@ final class AutomixAudioEngine {
         let playerNode = AVAudioPlayerNode()
         let timePitch = AVAudioUnitTimePitch()
         /// 5 bandas por Deck:
-        /// - Band 0: Low Shelf (185 Hz) -> Bass Swap / Corte de Graves
-        /// - Band 1: Parametric Mid (1050 Hz, BW 1.6 oct) -> Transição de 3 Bandas (Médios/Vocais)
-        /// - Band 2: High Shelf (4200 Hz) -> Transição de 3 Bandas (Agudos/Brilho)
+        /// - Band 0: Low Shelf (250 Hz) -> Bass Swap / Corte de Graves
+        /// - Band 1: Parametric Mid (1 kHz, BW 3 oct) -> Transição de 3 Bandas (Médios/Vocais)
+        /// - Band 2: High Shelf (2.2 kHz) -> Transição de 3 Bandas (Agudos/Brilho)
+        /// Frequências do EQ do rekordbox (tipo DJM-900NXS2): shelf 250 Hz, peak 1 kHz bem largo, shelf 2.2 kHz.
         /// - Band 3: High-Pass Filter (20 Hz a 3600 Hz) -> Filtro Passa-Alta DJ (Entrada/Saída)
         /// - Band 4: Low-Pass Filter (240 Hz a 20000 Hz) -> Filtro Passa-Baixa DJ (Entrada/Saída)
         let eq = AVAudioUnitEQ(numberOfBands: 5)
@@ -261,7 +262,7 @@ final class AutomixAudioEngine {
         var file: AVAudioFile?
         var songId: String?
         var nominalBPM: Double = 0
-        var loudnessRMSDB: Float? = nil
+        var loudnessLUFS: Float? = nil
         var loudnessPeakDB: Float? = nil
         var streamer: DeckPCMStreamer?
         var segmentStartSec: Double = 0
@@ -269,25 +270,26 @@ final class AutomixAudioEngine {
         var fileDuration: Double = 0
         var isPaused = false
 
+
         init() {
             let b = eq.bands
             if b.count >= 5 {
-                // Band 0: Graves (Low Shelf 185 Hz)
+                // Band 0: Graves (Low Shelf 250 Hz) — corta também o corpo do baixo (185–300 Hz) na troca de graves
                 b[0].filterType = .lowShelf
-                b[0].frequency = 185.0
+                b[0].frequency = 250.0
                 b[0].gain = 0.0
                 b[0].bypass = false
 
-                // Band 1: Médios (Parametric 1050 Hz)
+                // Band 1: Médios (Parametric 1 kHz, ~3 oitavas: ~350 Hz a ~2.8 kHz)
                 b[1].filterType = .parametric
-                b[1].frequency = 1050.0
-                b[1].bandwidth = 1.6
+                b[1].frequency = 1000.0
+                b[1].bandwidth = 3.0
                 b[1].gain = 0.0
                 b[1].bypass = false
 
-                // Band 2: Agudos (High Shelf 4200 Hz)
+                // Band 2: Agudos (High Shelf 2.2 kHz)
                 b[2].filterType = .highShelf
-                b[2].frequency = 4200.0
+                b[2].frequency = 2200.0
                 b[2].gain = 0.0
                 b[2].bypass = false
 
@@ -303,6 +305,7 @@ final class AutomixAudioEngine {
             }
             reverb.loadFactoryPreset(.largeHall2)
             reverb.wetDryMix = 0.0
+            reverb.bypass = true // reverb Hall com 0% de efeito ainda custa CPU: só liga quando houver cauda
         }
 
         func resetDSPToNeutral() {
@@ -317,6 +320,7 @@ final class AutomixAudioEngine {
                 b[4].bypass = true
             }
             reverb.wetDryMix = 0.0
+            reverb.bypass = true
         }
     }
 
@@ -324,9 +328,34 @@ final class AutomixAudioEngine {
 
     private let engine = AVAudioEngine()
     private let decks = [DeckChannel(), DeckChannel()]
+    /// Barramento de soma dos dois decks -> Peak Limiter -> mainMixerNode (evita clipping quando A e B tocam juntas)
+    private let mixBus = AVAudioMixerNode()
+    private let masterLimiter = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
+        componentType: kAudioUnitType_Effect,
+        componentSubType: kAudioUnitSubType_PeakLimiter,
+        componentManufacturer: kAudioUnitManufacturer_Apple,
+        componentFlags: 0,
+        componentFlagsMask: 0
+    ))
     private var activeIndex = 0
     private var isSetup = false
     private var monitorTimer: Timer?
+    private var monitorInterval: TimeInterval = 0
+    private var lastUIEmit: CFAbsoluteTime = 0
+    /// Intervalo mínimo entre atualizações de posição para a interface (o gerenciador usa 0,1 s com o player aberto e 0,5 s fora dele).
+    var uiUpdateInterval: TimeInterval = 0.5 {
+        didSet {
+            // Player aberto/fechado: reajusta a cadência na hora e já manda uma atualização para a tela
+            lastUIEmit = 0
+            guard monitorTimer != nil else { return }
+            let desired = desiredMonitorInterval()
+            if abs(desired - monitorInterval) > 0.0005 { scheduleMonitor(every: desired) }
+        }
+    }
+    /// Incrementado a cada nova preparação (e em todo reset de transição) para descartar análises em segundo plano obsoletas
+    private var prepareGeneration = 0
+    /// Enquanto a análise da Faixa B roda em segundo plano, segura o disparo de uma transição armada anteriormente
+    private var isPreparingIncoming = false
 
     // Estado da transição preparada para o par atual -> próximo
     private var transitionPlan: TransitionPlan?
@@ -336,6 +365,9 @@ final class AutomixAudioEngine {
     private var lastReportedPhase: Phase = .idle
     private var lastKnownTime: Double = 0
     private var incomingLastKnownTime: Double = 0
+    private var lastloggedPLLTime: Double = 0
+    private(set) var livePhaseErrorMs: Double = 0
+    private(set) var isPLLCorrecting: Bool = false
     private var configObserver: NSObjectProtocol?
     private(set) var isPlaying = false
     var isEngineRunning: Bool { engine.isRunning }
@@ -343,57 +375,115 @@ final class AutomixAudioEngine {
     var volumeCompensation: VolumeCompensationLevel = .off {
         didSet { reapplyLoudnessGain() }
     }
-    private var loudnessCache: [String: (rmsDB: Float, peakDB: Float)] = [:]
 
-    /// Mede RMS e Peak (dBFS) em 10 fatias do miolo do arquivo (~10ms) para compensação de volume sem clipping.
-    static func measureLoudness(url: URL) -> (rmsDB: Float, peakDB: Float)? {
+    /// Loudness integrada (LUFS) segundo ITU-R BS.1770-4: filtro K (shelf de agudos + passa-alta de 38 Hz),
+    /// blocos de 400 ms com 75% de sobreposição, gate absoluto de -70 LUFS e gate relativo de -10 LU.
+    /// Para não decodificar o arquivo inteiro, mede 12 janelas de 3.2 s espalhadas pela faixa (ou a faixa toda se for curta).
+    /// Também devolve o pico de amostra (dBFS) dessas janelas para a proteção contra clipping.
+    /// Custo de alguns décimos de segundo: chamar sempre fora da main thread.
+    nonisolated static func measureLoudness(url: URL) -> (lufs: Float, peakDB: Float)? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         let sr = file.processingFormat.sampleRate
         let totalFrames = file.length
-        guard sr > 0, totalFrames > 4096 else { return nil }
+        let chCount = min(Int(file.processingFormat.channelCount), 2)
+        guard sr >= 8_000, totalFrames > Int64(sr * 1.0), chCount > 0 else { return nil }
 
-        let sliceFrames = AVAudioFrameCount(min(Int64(sr * 0.18), totalFrames / 4))
-        guard sliceFrames >= 512,
-              let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: sliceFrames) else { return nil }
+        // Coeficientes do filtro K para a taxa do arquivo (fórmulas de referência do BS.1770 / libebur128)
+        let shelf: [Double] = {
+            let f0 = 1681.974450955533, g = 3.999843853973347, q = 0.7071752369554196
+            let k = tan(Double.pi * f0 / sr)
+            let vh = pow(10.0, g / 20.0)
+            let vb = pow(vh, 0.4996667741545416)
+            let a0 = 1.0 + k / q + k * k
+            return [(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0,
+                    2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0]
+        }()
+        let highPass: [Double] = {
+            let f0 = 38.13547087602444, q = 0.5003270373238773
+            let k = tan(Double.pi * f0 / sr)
+            let a0 = 1.0 + k / q + k * k
+            return [1.0, -2.0, 1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0]
+        }()
 
-        var sumSquares: Double = 0
-        var sampleCount: Int = 0
+        let subBlockFrames = max(Int(sr * 0.1), 1) // 100 ms; um bloco de 400 ms = 4 sub-blocos
+        let windowCount: Int
+        let windowFrames: Int
+        if Double(totalFrames) / sr <= 40.0 {
+            windowCount = 1
+            windowFrames = Int(totalFrames)
+        } else {
+            windowCount = 12
+            windowFrames = subBlockFrames * 32
+        }
+        guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(subBlockFrames)) else { return nil }
+
+        var blockPowers: [Double] = []
         var maxPeak: Float = 0.0001
-        let slices = 10
 
-        for i in 0..<slices {
-            let frac = 0.14 + (0.72 * Double(i) / Double(max(slices - 1, 1)))
-            let pos = min(max(0, Int64(Double(totalFrames) * frac)), max(0, totalFrames - Int64(sliceFrames)))
-            file.framePosition = pos
-            do {
+        for w in 0..<windowCount {
+            let frac = windowCount == 1 ? 0.0 : 0.08 + 0.84 * Double(w) / Double(windowCount - 1)
+            let start = min(max(0, Int64(Double(totalFrames) * frac)), max(0, totalFrames - Int64(windowFrames)))
+            file.framePosition = start
+
+            // Estado dos dois biquads (TDF-II) por canal; zerado em cada janela
+            var z = [[Double]](repeating: [0, 0, 0, 0], count: chCount)
+            var subPowers: [Double] = []
+            var framesLeft = windowFrames
+
+            while framesLeft >= subBlockFrames {
                 buf.frameLength = 0
-                try file.read(into: buf, frameCount: sliceFrames)
-            } catch {
-                continue
+                guard (try? file.read(into: buf, frameCount: AVAudioFrameCount(subBlockFrames))) != nil,
+                      Int(buf.frameLength) == subBlockFrames,
+                      let channels = buf.floatChannelData else { break }
+                framesLeft -= subBlockFrames
+
+                var power = 0.0
+                for ch in 0..<chCount {
+                    let x = channels[ch]
+                    var pk: Float = 0
+                    vDSP_maxmgv(x, 1, &pk, vDSP_Length(subBlockFrames))
+                    if pk > maxPeak { maxPeak = pk }
+
+                    var s1 = z[ch][0], s2 = z[ch][1], h1 = z[ch][2], h2 = z[ch][3]
+                    var sum = 0.0
+                    for i in 0..<subBlockFrames {
+                        let xi = Double(x[i])
+                        let y1 = shelf[0] * xi + s1
+                        s1 = shelf[1] * xi - shelf[3] * y1 + s2
+                        s2 = shelf[2] * xi - shelf[4] * y1
+                        let y2 = highPass[0] * y1 + h1
+                        h1 = highPass[1] * y1 - highPass[3] * y2 + h2
+                        h2 = highPass[2] * y1 - highPass[4] * y2
+                        sum += y2 * y2
+                    }
+                    z[ch] = [s1, s2, h1, h2]
+                    // Canais L/R têm peso 1.0 no BS.1770
+                    power += sum / Double(subBlockFrames)
+                }
+                subPowers.append(power)
             }
-            let n = Int(buf.frameLength)
-            guard n > 0, let channels = buf.floatChannelData else { continue }
-            let chCount = Int(buf.format.channelCount)
-            for ch in 0..<chCount {
-                var rms: Float = 0
-                var pk: Float = 0
-                vDSP_rmsqv(channels[ch], 1, &rms, vDSP_Length(n))
-                vDSP_maxmgv(channels[ch], 1, &pk, vDSP_Length(n))
-                sumSquares += Double(rms * rms) * Double(n)
-                sampleCount += n
-                if pk > maxPeak { maxPeak = pk }
+
+            // Descarta os 2 primeiros sub-blocos (transiente do filtro após o salto) e monta blocos de 400 ms com hop de 100 ms
+            if subPowers.count >= 6 {
+                for i in 2...(subPowers.count - 4) {
+                    blockPowers.append((subPowers[i] + subPowers[i + 1] + subPowers[i + 2] + subPowers[i + 3]) / 4.0)
+                }
             }
         }
-        guard sampleCount > 0 else { return nil }
-        let rms = max(Float(sqrt(sumSquares / Double(sampleCount))), 0.0001)
-        let rmsDB = 20.0 * log10(rms)
-        let peakDB = 20.0 * log10(maxPeak)
-        return (rmsDB, peakDB)
+
+        func lufs(_ power: Double) -> Double { -0.691 + 10.0 * log10(max(power, 1e-12)) }
+        let absGated = blockPowers.filter { lufs($0) > -70.0 }
+        guard !absGated.isEmpty else { return nil }
+        let relThreshold = lufs(absGated.reduce(0, +) / Double(absGated.count)) - 10.0
+        let relGated = absGated.filter { lufs($0) > relThreshold }
+        guard !relGated.isEmpty else { return nil }
+        let integrated = lufs(relGated.reduce(0, +) / Double(relGated.count))
+        return (Float(integrated), 20.0 * log10(maxPeak))
     }
 
-    static func computeGainDB(rmsDB: Float, peakDB: Float, level: VolumeCompensationLevel) -> Float {
+    nonisolated static func computeGainDB(lufs: Float, peakDB: Float, level: VolumeCompensationLevel) -> Float {
         guard level != .off else { return 0.0 }
-        let desired = level.targetDBFS - rmsDB
+        let desired = level.targetLUFS - lufs
         let clamped = min(max(desired, level.maxCutDB), level.maxBoostDB)
         // Proteção contra clipping: nunca empurra o pico acima de -0.5 dBFS
         let peakSafe = min(clamped, -0.5 - peakDB)
@@ -401,38 +491,42 @@ final class AutomixAudioEngine {
     }
 
     private func applyLoudness(to deck: DeckChannel, fileURL: URL?, songId: String?) {
-        guard let songId else {
-            deck.loudnessRMSDB = nil
+        // Compensação desligada: não decodifica nada e o deck toca no ganho original
+        guard volumeCompensation != .off, let songId else {
+            deck.loudnessLUFS = nil
             deck.loudnessPeakDB = nil
             deck.eq.globalGain = 0.0
             return
         }
-        if let cached = loudnessCache[songId] {
-            deck.loudnessRMSDB = cached.rmsDB
+        if let cached = LoudnessCache.shared.get(songId) {
+            deck.loudnessLUFS = cached.lufs
             deck.loudnessPeakDB = cached.peakDB
-        } else if let url = fileURL, let measured = Self.measureLoudness(url: url) {
-            loudnessCache[songId] = measured
-            deck.loudnessRMSDB = measured.rmsDB
-            deck.loudnessPeakDB = measured.peakDB
-        } else {
-            deck.loudnessRMSDB = nil
-            deck.loudnessPeakDB = nil
+            deck.eq.globalGain = Self.computeGainDB(lufs: cached.lufs, peakDB: cached.peakDB, level: volumeCompensation)
+            return
         }
 
-        if let rms = deck.loudnessRMSDB, let pk = deck.loudnessPeakDB {
-            deck.eq.globalGain = Self.computeGainDB(rmsDB: rms, peakDB: pk, level: volumeCompensation)
-        } else {
-            deck.eq.globalGain = 0.0
+        // Ainda sem medição: toca em ganho neutro e mede em segundo plano (nunca decodifica na main thread)
+        deck.loudnessLUFS = nil
+        deck.loudnessPeakDB = nil
+        deck.eq.globalGain = 0.0
+        guard let url = fileURL else { return }
+        Task { [weak self] in
+            let measured = await Task.detached(priority: .utility) { Self.measureLoudness(url: url) }.value
+            guard let self, let measured else { return }
+            LoudnessCache.shared.set(songId, lufs: measured.lufs, peakDB: measured.peakDB)
+            guard self.volumeCompensation != .off else { return }
+            for d in self.decks where d.songId == songId {
+                d.loudnessLUFS = measured.lufs
+                d.loudnessPeakDB = measured.peakDB
+                d.eq.globalGain = Self.computeGainDB(lufs: measured.lufs, peakDB: measured.peakDB, level: self.volumeCompensation)
+            }
         }
     }
 
+    /// Reaplica a compensação nos decks (ao mudar o nível nos ajustes), medindo o que ainda não tiver medição.
     private func reapplyLoudnessGain() {
-        for d in decks {
-            if let rms = d.loudnessRMSDB, let pk = d.loudnessPeakDB {
-                d.eq.globalGain = Self.computeGainDB(rmsDB: rms, peakDB: pk, level: volumeCompensation)
-            } else {
-                d.eq.globalGain = 0.0
-            }
+        for d in decks where d.songId != nil {
+            applyLoudness(to: d, fileURL: d.file?.url, songId: d.songId)
         }
     }
 
@@ -496,7 +590,7 @@ final class AutomixAudioEngine {
         seek(to: resumeTime)
 
         if let savedPlan, let savedFileB, let savedSongIdB {
-            prepareIncoming(fileB: savedFileB, songId: savedSongIdB, plan: savedPlan)
+            Task { await prepareIncoming(fileB: savedFileB, songId: savedSongIdB, plan: savedPlan) }
         }
     }
 
@@ -510,6 +604,17 @@ final class AutomixAudioEngine {
         isSetup = true
 
         // Grafo 100% estático em 48 kHz Stereo: nunca desconecta ou reconecta nós após o setup
+        engine.attach(mixBus)
+        engine.attach(masterLimiter)
+        engine.connect(mixBus, to: masterLimiter, format: Self.renderFormat)
+        engine.connect(masterLimiter, to: engine.mainMixerNode, format: Self.renderFormat)
+        // Ataque rápido (2 ms) e liberação curta (50 ms): segura só os picos da soma A+B, sem "bombear" a mix
+        masterLimiter.withAudioUnit { unit in
+            AudioUnitSetParameter(unit, kLimiterParam_AttackTime, kAudioUnitScope_Global, 0, 0.002, 0)
+            AudioUnitSetParameter(unit, kLimiterParam_DecayTime, kAudioUnitScope_Global, 0, 0.05, 0)
+            AudioUnitSetParameter(unit, kLimiterParam_PreGain, kAudioUnitScope_Global, 0, 0.0, 0)
+        }
+
         for deck in decks {
             engine.attach(deck.playerNode)
             engine.attach(deck.timePitch)
@@ -518,7 +623,7 @@ final class AutomixAudioEngine {
             engine.connect(deck.playerNode, to: deck.timePitch, format: Self.renderFormat)
             engine.connect(deck.timePitch, to: deck.eq, format: Self.renderFormat)
             engine.connect(deck.eq, to: deck.reverb, format: Self.renderFormat)
-            engine.connect(deck.reverb, to: engine.mainMixerNode, format: Self.renderFormat)
+            engine.connect(deck.reverb, to: mixBus, format: Self.renderFormat)
         }
         engine.prepare()
     }
@@ -530,6 +635,9 @@ final class AutomixAudioEngine {
         }
     }
 
+    /// Para o deck e o deixa ocioso: o TimePitch (algoritmo de esticamento, caro) fica em bypass enquanto só processaria
+    /// silêncio. Quem for tocar neste deck precisa chamar `activate(_:)` antes (nunca no meio do áudio: o bypass
+    /// muda a latência do TimePitch e desalinharia os dois decks).
     private func resetDeckNode(_ deck: DeckChannel) {
         deck.streamer?.cancel()
         deck.streamer = nil
@@ -538,9 +646,56 @@ final class AutomixAudioEngine {
         deck.resetDSPToNeutral()
         deck.prerollSilenceSec = 0
         deck.isPaused = false
+        deck.timePitch.bypass = true
+    }
+
+    /// Liga o TimePitch de um deck que vai tocar (chamar com o deck parado, antes de agendar áudio).
+    private func activate(_ deck: DeckChannel) {
+        if deck.timePitch.bypass { deck.timePitch.bypass = false }
     }
 
     // MARK: - Leitura do tempo interno exato (sample-accurate mesmo com TimePitch ativo)
+
+    /// Snapshot instantâneo O(1) do estado dos dois decks para renderização a 60 FPS no Espectrograma Rekordbox.
+    struct LiveDeckSnapshot {
+        let songIdA: String?
+        let timeA: Double
+        let durationA: Double
+        let rateA: Float
+        let nominalBPMA: Double
+        let songIdB: String?
+        let timeB: Double
+        let durationB: Double
+        let rateB: Float
+        let nominalBPMB: Double
+        let hasStartedIncoming: Bool
+        let phase: Phase
+        let plan: TransitionPlan?
+        var phaseErrorMs: Double = 0
+        var isPLLCorrecting: Bool = false
+    }
+
+    func liveDeckSnapshot() -> LiveDeckSnapshot {
+        let tA = currentTime(for: activeDeck)
+        let tB = hasStartedIncoming ? currentTime(for: incomingDeck) : incomingDeck.segmentStartSec
+        return LiveDeckSnapshot(
+            songIdA: activeDeck.songId,
+            timeA: tA,
+            durationA: activeDeck.fileDuration,
+            rateA: activeDeck.timePitch.rate,
+            nominalBPMA: activeDeck.nominalBPM,
+            songIdB: incomingDeck.songId,
+            timeB: tB,
+            durationB: incomingDeck.fileDuration,
+            rateB: incomingDeck.timePitch.rate,
+            nominalBPMB: incomingDeck.nominalBPM,
+            hasStartedIncoming: hasStartedIncoming,
+            phase: lastReportedPhase,
+            plan: transitionPlan,
+            phaseErrorMs: livePhaseErrorMs,
+            isPLLCorrecting: isPLLCorrecting
+        )
+    }
 
     func currentTrackTime() -> Double {
         currentTime(for: activeDeck)
@@ -554,137 +709,34 @@ final class AutomixAudioEngine {
             return nil
         }
         let pRate = playerTime.sampleRate > 0 ? playerTime.sampleRate : Self.renderFormat.sampleRate
-        let elapsed = max(0, Double(playerTime.sampleTime) / pRate - deck.prerollSilenceSec)
-        return min(deck.segmentStartSec + elapsed, deck.fileDuration)
+        let rawSamples = playerTime.sampleTime
+        let prerollSamples = Int64(round(deck.prerollSilenceSec * pRate))
+        if rawSamples <= prerollSamples {
+            return deck.segmentStartSec
+        }
+        let elapsedSourceSec = Double(rawSamples - prerollSamples) / pRate
+        return min(deck.segmentStartSec + elapsedSourceSec, deck.fileDuration)
     }
 
-    /// Detecta o ataque real da batida/bumbo (kick onset) no PCM decodificado pelo próprio `AVAudioFile`
-    /// numa janela curta de ±35 ms ao redor do timestamp planejado. Elimina desvio de priming MP3/AAC
-    /// sem jamais pular para uma caixa/contratempo distante. Retorna `targetSec` inalterado sem percussão clara.
-    private static func snapToNearestBeatOnset(url: URL, targetSec: Double, maxShiftSec: Double = 0.035) -> Double {
-        guard let file = try? AVAudioFile(forReading: url) else { return targetSec }
-        let sr = file.processingFormat.sampleRate
-        let totalFrames = file.length
-        guard sr >= 8_000, totalFrames > 4_096 else { return targetSec }
-        let dur = Double(totalFrames) / sr
-
-        let searchRadius = maxShiftSec + 0.015
-        let winStart = max(0.0, targetSec - searchRadius)
-        let winEnd = min(dur - 0.02, targetSec + searchRadius)
-        guard winEnd - winStart >= 0.06 else { return targetSec }
-
-        let startFrame = AVAudioFramePosition(winStart * sr)
-        let frameCount = AVAudioFrameCount(min(Double(totalFrames - startFrame), (winEnd - winStart) * sr))
-        guard frameCount >= 512,
-              let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount) else {
-            return targetSec
-        }
-
-        file.framePosition = startFrame
-        do {
-            try file.read(into: buf, frameCount: frameCount)
-        } catch {
-            return targetSec
-        }
-
-        let n = Int(buf.frameLength)
-        guard n >= 512, let chData = buf.floatChannelData else { return targetSec }
-        let chCount = Int(buf.format.channelCount)
-
-        // Mix para mono Float32
-        var mono = [Float](repeating: 0, count: n)
-        if chCount == 1 {
-            memcpy(&mono, chData[0], n * MemoryLayout<Float>.size)
-        } else {
-            var scale: Float = 1.0 / Float(chCount)
-            for c in 0..<chCount {
-                vDSP_vsma(chData[c], 1, &scale, mono, 1, &mono, 1, vDSP_Length(n))
-            }
-        }
-
-        // Filtro passa-baixa de 1 polo (~160 Hz) para isolar exclusivamente o ataque do bumbo (kick)
-        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 160.0 / sr))
-        var low = [Float](repeating: 0, count: n)
-        var y: Float = 0
-        for i in 0..<n {
-            y += alpha * (mono[i] - y)
-            low[i] = y
-        }
-
-        // Energia focada no bumbo (85% sub-grave/kick + 15% banda larga) em quadros de 5 ms com salto de 2.5 ms
-        let hop = max(1, Int(round(sr * 0.0025)))
-        let win = max(hop * 2, Int(round(sr * 0.005)))
-        let numFrames = (n - win) / hop
-        guard numFrames >= 8 else { return targetSec }
-
-        var energies = [Float](repeating: 0, count: numFrames)
-        for f in 0..<numFrames {
-            let offset = f * hop
-            var rmsLow: Float = 0
-            var rmsFull: Float = 0
-            low.withUnsafeBufferPointer { ptr in
-                vDSP_rmsqv(ptr.baseAddress! + offset, 1, &rmsLow, vDSP_Length(win))
-            }
-            mono.withUnsafeBufferPointer { ptr in
-                vDSP_rmsqv(ptr.baseAddress! + offset, 1, &rmsFull, vDSP_Length(win))
-            }
-            energies[f] = 0.85 * rmsLow + 0.15 * rmsFull
-        }
-
-        // Fluxo de onset positivo (subida súbita de energia = ataque da batida)
-        var flux = [Float](repeating: 0, count: numFrames)
-        for f in 1..<numFrames {
-            flux[f] = max(0, energies[f] - energies[f - 1])
-        }
-
-        // Mediana do fluxo para garantir que só faz snap em transientes reais (ignora intros/outros ambientes)
-        let sortedFlux = flux.sorted()
-        let medianFlux = max(sortedFlux[sortedFlux.count / 2], 1e-6)
-
-        // Ponderação suave favorecendo onsets próximos ao timestamp planejado
-        var bestIdx = -1
-        var bestScore: Float = 0
-        var bestRawFlux: Float = 0
-        for f in 1..<numFrames {
-            let frameSec = winStart + Double(f * hop) / sr
-            let dist = abs(frameSec - targetSec)
-            guard dist <= maxShiftSec else { continue }
-            let weight = Float(1.0 - 0.30 * (dist / maxShiftSec))
-            let score = flux[f] * weight
-            if score > bestScore {
-                bestScore = score
-                bestRawFlux = flux[f]
-                bestIdx = f
-            }
-        }
-
-        guard bestIdx >= 1, bestRawFlux >= medianFlux * 2.8, bestRawFlux >= 0.002 else {
-            return targetSec
-        }
-
-        // Recua 1 salto (~2.5 ms) para o início exato da rampa de ataque do bumbo
-        let snappedSec = winStart + Double(max(0, bestIdx - 1) * hop) / sr
-        return min(max(0.0, snappedSec), dur - 0.05)
-    }
-
-    /// Mede o BPM real local (precisão de 0.1 BPM) diretamente no envelope de bumbos (< 170 Hz)
-    /// da janela de transição do arquivo decodificado. Usado em segundo plano antes de armar o mix
-    /// para corrigir desvios de arredondamento do `allin1` (ex.: 145.3 vs 148.3 BPM tratados como 1.000x).
+    /// Mede o BPM contínuo real local (sem quantização de 5 ms!) diretamente no envelope de bumbos (45–150 Hz)
+    /// da janela de transição do arquivo decodificado. Usa hop de 2 ms com suavização triangular de 12 ms
+    /// e pente de 1, 2, 4, 8 e 16 batidas (4 compassos) para eliminar falsos desvios de 0.6%–1% e detectar
+    /// diferenças reais de andamento (como 145.3 vs 148.1 BPM).
     nonisolated private static func measureLocalTrueBPM(
         url: URL,
         aroundSec: Double,
-        windowSec: Double = 24.0,
+        windowSec: Double = 28.0,
         hintBPM: Double
     ) -> (bpm: Double, confidence: Double)? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         let sr = file.processingFormat.sampleRate
         let totalFrames = file.length
-        guard sr >= 8_000, totalFrames > Int64(sr * 8.0) else { return nil }
+        guard sr >= 8_000, totalFrames > Int64(sr * 10.0) else { return nil }
         let dur = Double(totalFrames) / sr
 
         let startSec = max(0.0, min(aroundSec, dur - windowSec))
         let readDur = min(windowSec, dur - startSec)
-        guard readDur >= 8.0 else { return nil }
+        guard readDur >= 10.0 else { return nil }
 
         let startFrame = AVAudioFramePosition(startSec * sr)
         let frameCount = AVAudioFrameCount(readDur * sr)
@@ -693,7 +745,7 @@ final class AutomixAudioEngine {
         do { try file.read(into: buf, frameCount: frameCount) } catch { return nil }
 
         let n = Int(buf.frameLength)
-        guard n > Int(sr * 6.0), let chData = buf.floatChannelData else { return nil }
+        guard n > Int(sr * 8.0), let chData = buf.floatChannelData else { return nil }
         let chCount = Int(buf.format.channelCount)
         var mono = [Float](repeating: 0, count: n)
         if chCount == 1 {
@@ -705,81 +757,136 @@ final class AutomixAudioEngine {
             }
         }
 
-        // Filtro passa-baixa ~170 Hz para isolar o pulso dos bumbos
-        let alpha = Float(1.0 - exp(-2.0 * Double.pi * 170.0 / sr))
-        var low = [Float](repeating: 0, count: n)
-        var y: Float = 0
+        // Passa-faixa de bumbo (45–150 Hz): isola o transiente do kick e remove sub-bass contínuo
+        let aLP = Float(1.0 - exp(-2.0 * Double.pi * 150.0 / sr))
+        let aHP = Float(1.0 - exp(-2.0 * Double.pi * 45.0 / sr))
+        var kick = [Float](repeating: 0, count: n)
+        var lp150: Float = 0
+        var lp45: Float = 0
         for i in 0..<n {
-            y += alpha * (mono[i] - y)
-            low[i] = y
+            let x = mono[i]
+            lp150 += aLP * (x - lp150)
+            lp45 += aHP * (x - lp45)
+            kick[i] = lp150 - lp45
         }
 
-        let hopSec = 0.005 // 5 ms (200 fps)
+        let hopSec = 0.002 // 2 ms (500 fps)
         let hop = max(1, Int(round(sr * hopSec)))
         let win = hop * 2
         let m = (n - win) / hop
-        guard m > 400 else { return nil }
+        guard m > 1_000 else { return nil }
 
         var env = [Float](repeating: 0, count: m)
         for f in 0..<m {
             var rms: Float = 0
-            low.withUnsafeBufferPointer { ptr in
+            kick.withUnsafeBufferPointer { ptr in
                 vDSP_rmsqv(ptr.baseAddress! + f * hop, 1, &rms, vDSP_Length(win))
             }
             env[f] = rms
         }
 
-        var flux = [Float](repeating: 0, count: m)
+        var rawFlux = [Float](repeating: 0, count: m)
         for f in 1..<m {
-            flux[f] = max(0, env[f] - env[f - 1])
+            rawFlux[f] = max(0, env[f] - env[f - 1])
         }
 
-        // Busca fina (±12% em passos de 0.1 BPM) usando pente multi-batida (1, 2, 4 e 8 batidas)
+        // Suavização triangular (±3 frames = ±6 ms) para eliminar picos de 1 amostra que travavam lags inteiros
+        var flux = [Float](repeating: 0, count: m)
+        let kHalf = 3
+        for f in kHalf..<(m - kHalf) {
+            var s: Float = 0
+            for j in -kHalf...kHalf {
+                let w = Float(kHalf + 1 - abs(j))
+                s += rawFlux[f + j] * w
+            }
+            flux[f] = s / 16.0
+        }
+
         let baseHint = hintBPM > 50 ? hintBPM : 125.0
-        let loBPM = max(65.0, baseHint * 0.88)
-        let hiBPM = min(200.0, baseHint * 1.12)
-        var bestBPM = baseHint
-        var bestScore = -1.0
-        var sumScores = 0.0
-        var countScores = 0
+        let loBPM = max(65.0, baseHint * 0.90)
+        let hiBPM = min(205.0, baseHint * 1.10)
 
-        let startStep = Int(round(loBPM * 10.0))
-        let endStep = Int(round(hiBPM * 10.0))
-        let mults: [(Double, Double)] = [(1.0, 1.0), (2.0, 1.0), (4.0, 1.2), (8.0, 1.0)]
+        // Pente multi-compasso (1, 2, 4, 8 e 16 batidas = 4 compassos inteiros!)
+        let mults: [(Double, Double)] = [(1.0, 0.7), (2.0, 0.9), (4.0, 1.4), (8.0, 1.5), (16.0, 1.5)]
 
-        for step in startStep...endStep {
-            let bpm = Double(step) / 10.0
+        func evalScore(for bpm: Double) -> Double {
             let period = (60.0 / bpm) / hopSec
             var score = 0.0
             var weightSum = 0.0
             for (mult, w) in mults {
-                let lag = Int(round(period * mult))
-                if lag >= m - 20 { continue }
-                var dot: Float = 0
+                let exactLag = period * mult
+                let lag0 = Int(floor(exactLag))
+                let frac = Float(exactLag - Double(lag0))
+                if lag0 < 1 || lag0 + 1 >= m - 40 { continue }
+                let count = vDSP_Length(m - lag0 - 1)
+                var dot0: Float = 0
+                var dot1: Float = 0
                 flux.withUnsafeBufferPointer { ptr in
-                    vDSP_dotpr(ptr.baseAddress!, 1, ptr.baseAddress! + lag, 1, &dot, vDSP_Length(m - lag))
+                    let base = ptr.baseAddress!
+                    vDSP_dotpr(base, 1, base + lag0, 1, &dot0, count)
+                    vDSP_dotpr(base, 1, base + lag0 + 1, 1, &dot1, count)
                 }
-                score += (Double(dot) / Double(m - lag)) * w
+                let interp = Double(dot0 * (1.0 - frac) + dot1 * frac) / Double(count)
+                score += interp * w
                 weightSum += w
             }
-            guard weightSum > 0 else { continue }
-            let norm = score / weightSum
-            sumScores += norm
+            return weightSum > 0 ? (score / weightSum) : 0.0
+        }
+
+        // 1. Varredura inicial (passo de 0.15 BPM)
+        let coarseStep = 0.15
+        var bestBPM = baseHint
+        var bestScore = -1.0
+        var sumScores = 0.0
+        var countScores = 0
+        var b = loBPM
+        while b <= hiBPM {
+            let sc = evalScore(for: b)
+            sumScores += sc
             countScores += 1
-            if norm > bestScore {
-                bestScore = norm
-                bestBPM = bpm
+            if sc > bestScore {
+                bestScore = sc
+                bestBPM = b
             }
+            b += coarseStep
+        }
+
+        // 2. Refinamento fino contínuo (±0.30 BPM em passos de 0.01 BPM) + interpolação parabólica exata
+        var fineBestBPM = bestBPM
+        var fineBestScore = bestScore
+        let fineStep = 0.01
+        var fb = max(loBPM, bestBPM - 0.30)
+        let fbEnd = min(hiBPM, bestBPM + 0.30)
+        while fb <= fbEnd {
+            let sc = evalScore(for: fb)
+            if sc > fineBestScore {
+                fineBestScore = sc
+                fineBestBPM = fb
+            }
+            fb += fineStep
+        }
+
+        let sL = evalScore(for: max(loBPM, fineBestBPM - fineStep))
+        let sC = fineBestScore
+        let sR = evalScore(for: min(hiBPM, fineBestBPM + fineStep))
+        let denom = (sL - 2.0 * sC + sR)
+        let exactBPM: Double
+        if abs(denom) > 1e-12 {
+            let delta = 0.5 * (sL - sR) / denom
+            exactBPM = fineBestBPM + min(max(delta, -1.0), 1.0) * fineStep
+        } else {
+            exactBPM = fineBestBPM
         }
 
         guard countScores > 0 else { return nil }
         let avgScore = sumScores / Double(countScores)
-        let confidence = avgScore > 1e-9 ? (bestScore / avgScore) : 0.0
-        return (bestBPM, confidence)
+        let confidence = avgScore > 1e-9 ? (fineBestScore / avgScore) : 0.0
+        return (exactBPM, confidence)
     }
 
-    /// Verifica o BPM real de ambas as faixas nas janelas exatas da transição e corrige `targetRateA` / `initialRateB`
-    /// caso o servidor (`allin1`) ou a análise local tenha arredondado errado o BPM.
+    /// Verifica o BPM real exato (sem arredondamentos) de ambas as faixas nas janelas da transição
+    /// e só substitui `targetRateA` / `initialRateB` quando o áudio comprovar com alta confiança periódica
+    /// que há uma divergência real de andamento (>= 0.85%) em relação ao plano do servidor.
     nonisolated static func refineTransitionPlanWithTrueBPM(
         plan: TransitionPlan,
         urlA: URL,
@@ -787,14 +894,12 @@ final class AutomixAudioEngine {
     ) -> TransitionPlan {
         guard plan.transitionType == "beatmatch" else { return plan }
 
-        // Janela da Faixa A: 24s terminando logo após `mixStartSec` (pega a batida real na saída)
-        let winStartA = max(0.0, plan.trackA.mixStartSec - 16.0)
-        // Janela da Faixa B: 24s a partir de `entrySec` (pega a batida real na entrada)
+        let winStartA = max(0.0, plan.trackA.mixStartSec - 20.0)
         let winStartB = max(0.0, plan.trackB.entrySec)
 
-        guard let measA = measureLocalTrueBPM(url: urlA, aroundSec: winStartA, windowSec: 24.0, hintBPM: plan.trackA.bpm),
-              let measB = measureLocalTrueBPM(url: urlB, aroundSec: winStartB, windowSec: 24.0, hintBPM: plan.trackB.bpm),
-              measA.confidence >= 1.55, measB.confidence >= 1.55 else {
+        guard let measA = measureLocalTrueBPM(url: urlA, aroundSec: winStartA, windowSec: 28.0, hintBPM: plan.trackA.bpm),
+              let measB = measureLocalTrueBPM(url: urlB, aroundSec: winStartB, windowSec: 28.0, hintBPM: plan.trackB.bpm),
+              measA.confidence >= 1.75, measB.confidence >= 1.75 else {
             return plan
         }
 
@@ -809,14 +914,15 @@ final class AutomixAudioEngine {
         }
 
         let oldCombinedRatio = Double(plan.sync.targetRateA) / Double(max(plan.sync.initialRateB ?? 1.0, 0.5))
-        guard abs(trueRatio - oldCombinedRatio) >= 0.004 else {
+        // Evita alterar planos já precisos do `allin1` por micro-variações (< 0.85%), mas corrige erros reais (ex.: 145.3 vs 148.1 BPM = 2.0%)
+        guard abs(trueRatio - oldCombinedRatio) >= 0.0085 else {
             return plan
         }
 
         var updated = plan
         updated.trackA = TrackATiming(
             id: plan.trackA.id,
-            bpm: (measA.bpm * 10.0).rounded() / 10.0,
+            bpm: measA.bpm,
             rampStartSec: plan.trackA.rampStartSec,
             mixStartSec: plan.trackA.mixStartSec,
             mixEndSec: plan.trackA.mixEndSec,
@@ -824,7 +930,7 @@ final class AutomixAudioEngine {
         )
         updated.trackB = TrackBTiming(
             id: plan.trackB.id,
-            bpm: (measB.bpm * 10.0).rounded() / 10.0,
+            bpm: measB.bpm,
             entrySec: plan.trackB.entrySec,
             section: plan.trackB.section
         )
@@ -844,7 +950,7 @@ final class AutomixAudioEngine {
 
         // Se o plano original achava que o BPM era igual (sem rampa), cria uma rampa suave variável + hold
         let rateDelta = Double(abs(newRateA - 1.0))
-        if rateDelta >= 0.003 && (updated.sync.rampDurationSec < 0.5 || updated.trackA.rampStartSec >= updated.trackA.mixStartSec - 1.0) {
+        if rateDelta >= 0.002 && (updated.sync.rampDurationSec < 0.5 || updated.trackA.rampStartSec >= updated.trackA.mixStartSec - 1.0) {
             let barSec = 4.0 * 60.0 / max(measA.bpm, 60.0)
             let rampBars: Double = rateDelta < 0.020 ? 8.0 : (rateDelta < 0.045 ? 10.0 : 12.0)
             let holdBars: Double = rateDelta < 0.020 ? 4.0 : (rateDelta < 0.045 ? 6.0 : 8.0)
@@ -855,7 +961,7 @@ final class AutomixAudioEngine {
             updated.sync.rampDurationSec = actualLead * (rampBars / (rampBars + holdBars))
         }
 
-        print(String(format: "[SYNC-LOCK] TrueBPM corrigido: A=%.1f (conf %.1fx) | B=%.1f (conf %.1fx) → RateA=%.3fx RateB=%.3fx (antes %.3fx)",
+        print(String(format: "[SYNC-LOCK] TrueBPM exato: A=%.4f (conf %.1fx) | B=%.4f (conf %.1fx) → RateA=%.5fx RateB=%.5fx (antes %.5fx)",
                      measA.bpm, measA.confidence, measB.bpm, measB.confidence,
                      newRateA, newRateB, plan.sync.targetRateA))
         return updated
@@ -890,6 +996,7 @@ final class AutomixAudioEngine {
         }
 
         let deck = activeDeck
+        activate(deck)
         let sr = file.processingFormat.sampleRate
         let totalDur = Double(file.length) / max(sr, 1)
         let clampedSec = min(max(startAtSec, 0), max(totalDur - 0.5, 0))
@@ -931,13 +1038,22 @@ final class AutomixAudioEngine {
 
     /// Agenda o Deck B já posicionado no `entry_sec` (downbeat inicial) pronto para sobreposição + EQ + Filtro DJ.
     /// Retorna o `TransitionPlan` efetivo (já com BeatSnap / ajustes de seek) para manter a barra de progresso 100% sincronizada.
+    /// A análise de áudio roda em segundo plano; retorna `nil` se foi cancelada (seek, troca de faixa ou nova preparação).
     @discardableResult
-    func prepareIncoming(fileB: AVAudioFile, songId: String, plan: TransitionPlan) -> TransitionPlan? {
+    func prepareIncoming(fileB: AVAudioFile, songId: String, plan: TransitionPlan) async -> TransitionPlan? {
         guard !hasStartedIncoming, !hasTriggeredPlayAtFuture else { return nil }
         guard Self.canPlay(file: fileB) else {
             clearPreparedIncoming()
             return nil
         }
+
+        prepareGeneration &+= 1
+        let generation = prepareGeneration
+        isPreparingIncoming = true
+        defer {
+            if generation == prepareGeneration { isPreparingIncoming = false }
+        }
+        let activeSongId = activeDeck.songId
 
         var effectivePlan = plan
         let now = currentTime(for: activeDeck)
@@ -960,51 +1076,90 @@ final class AutomixAudioEngine {
             activeDeck.resetDSPToNeutral()
         }
 
-        let incoming = incomingDeck
-        resetDeckNode(incoming)
-
         let sr = fileB.processingFormat.sampleRate
         let totalDur = Double(fileB.length) / max(sr, 1)
+        let urlB = fileB.url
 
-        // 1. Micro-alinhamento de batida no PCM real (elimina desvio de priming MP3/AAC e jitter de downbeat)
+        // Os pontos de mix já chegam no downbeat da grade constante do servidor (análise v2): o app não
+        // re-detecta batidas no áudio. Em segundo plano só mede a loudness da Faixa B, se ainda não tiver.
+        let measuredLoudnessB: (lufs: Float, peakDB: Float)?
+        if volumeCompensation != .off, LoudnessCache.shared.get(songId) == nil {
+            measuredLoudnessB = await Task.detached(priority: .userInitiated) { Self.measureLoudness(url: urlB) }.value
+        } else {
+            measuredLoudnessB = nil
+        }
+
+        // Durante a análise o usuário pode ter dado seek, trocado de faixa ou outra preparação pode ter começado
+        guard generation == prepareGeneration,
+              activeDeck.songId == activeSongId,
+              !hasStartedIncoming, !hasTriggeredPlayAtFuture else { return nil }
+
+        if let measured = measuredLoudnessB {
+            LoudnessCache.shared.set(songId, lufs: measured.lufs, peakDB: measured.peakDB)
+        }
+
+        // Se a medição terminou em cima do ponto de mix, adia a entrada em batidas INTEIRAS de A:
+        // a fase entre as grades de A e B continua a mesma (o PLL pela grade faz o ajuste fino).
+        let nowAfter = currentTime(for: activeDeck)
+        let minLead = 0.35
+        if effectivePlan.trackA.mixStartSec - nowAfter < minLead {
+            let beatSecA = 60.0 / max(effectivePlan.trackA.bpm, 60.0)
+            let needed = minLead - (effectivePlan.trackA.mixStartSec - nowAfter)
+            let shift = ceil(needed / beatSecA) * beatSecA
+            guard durA <= 0 || effectivePlan.trackA.mixStartSec + shift < durA - 3.0 else {
+                clearPreparedIncoming()
+                return nil
+            }
+            effectivePlan.trackA.mixStartSec += shift
+            effectivePlan.trackA.mixEndSec += shift
+            if durA > 0 {
+                effectivePlan.trackA.mixEndSec = min(effectivePlan.trackA.mixEndSec, durA - 0.15)
+            }
+            effectivePlan.trackA.rampStartSec = min(max(nowAfter, effectivePlan.trackA.rampStartSec), effectivePlan.trackA.mixStartSec)
+            effectivePlan.mix.durationSec = max(2.0, effectivePlan.trackA.mixEndSec - effectivePlan.trackA.mixStartSec)
+        }
+
         if effectivePlan.transitionType == "beatmatch" {
-            let origMixStart = effectivePlan.trackA.mixStartSec
-            let origEntryB = effectivePlan.trackB.entrySec
-
-            if let urlA = activeDeck.file?.url, durA > 0, now < origMixStart - 0.5 {
-                let snappedA = Self.snapToNearestBeatOnset(url: urlA, targetSec: origMixStart)
-                let deltaA = snappedA - origMixStart
-                if abs(deltaA) >= 0.002 && abs(deltaA) <= 0.035 {
-                    effectivePlan.trackA.mixStartSec = snappedA
-                    effectivePlan.trackA.mixEndSec = min(durA - 0.15, effectivePlan.trackA.mixEndSec + deltaA)
+            // 2. Adapta a duração da saída de forma inteligente conforme a combinação real das seções (nunca tempo fixo cego!):
+            //    - Vocal + Vocal (ex.: chorus/verse -> verse/chorus): 8 compassos se o BPM for rápido (>= 130) ou 6 compassos se lento,
+            //      para não embolar dois cantores mas sem jamais encurtar a ponto de parecer corte seco.
+            //    - Instrumental / Bridge -> Intro / Beat: permite respirar por 8 a 16 compassos completos conforme o plano da IA!
+            //    A duração é sempre um número inteiro de compassos de A (o fim do mix cai no tempo 1 de um compasso).
+            let secALow = (effectivePlan.trackA.section ?? "").lowercased()
+            let secBLow = (effectivePlan.trackB.section ?? "").lowercased()
+            let aHasStrongVocal = secALow.contains("chorus") || secALow.contains("voz")
+            let bHasStrongVocal = secBLow.contains("chorus") || secBLow.contains("voz")
+            if aHasStrongVocal && bHasStrongVocal, (effectivePlan.mix.bars ?? 8) > 8 {
+                let barSec = 4.0 * 60.0 / max(effectivePlan.trackA.bpm, 60.0)
+                let targetBars = effectivePlan.trackA.bpm >= 130.0 ? 8 : 6
+                let adaptedDur = Double(targetBars) * barSec
+                if effectivePlan.trackA.mixEndSec - effectivePlan.trackA.mixStartSec > adaptedDur + 1.0 {
+                    effectivePlan.trackA.mixEndSec = min(durA - 0.15, effectivePlan.trackA.mixStartSec + adaptedDur)
+                    effectivePlan.mix.bars = targetBars
+                    effectivePlan.mix.durationSec = effectivePlan.trackA.mixEndSec - effectivePlan.trackA.mixStartSec
                 }
             }
 
-            let snappedB = Self.snapToNearestBeatOnset(url: fileB.url, targetSec: origEntryB)
-            let deltaB = snappedB - origEntryB
-            if abs(deltaB) >= 0.002 && abs(deltaB) <= 0.035 {
-                effectivePlan.trackB.entrySec = snappedB
-            }
-
-            // 2. Preserva a rampa variável do plano (calculada conforme a combinação das duas faixas:
+            // 3. Preserva a rampa variável do plano (calculada conforme a combinação das duas faixas:
             //    sobe suavemente o BPM com antecedência e mantém tocando no novo ritmo antes de mixar).
             //    Só adapta a rampa se o usuário já estiver depois de `rampStartSec` (ex.: arrastou a barra).
             let rateDelta = Double(abs(effectivePlan.sync.targetRateA - 1.0))
             if rateDelta >= 0.003,
-               now > effectivePlan.trackA.rampStartSec && now < effectivePlan.trackA.mixStartSec - 0.25 {
-                let avail = effectivePlan.trackA.mixStartSec - now
-                effectivePlan.trackA.rampStartSec = now
+               nowAfter > effectivePlan.trackA.rampStartSec && nowAfter < effectivePlan.trackA.mixStartSec - 0.25 {
+                let avail = effectivePlan.trackA.mixStartSec - nowAfter
+                effectivePlan.trackA.rampStartSec = nowAfter
                 effectivePlan.sync.rampDurationSec = max(0.35, min(effectivePlan.sync.rampDurationSec, avail * 0.72))
             }
 
-            let dAMs = Int(((effectivePlan.trackA.mixStartSec - origMixStart) * 1000.0).rounded())
-            let dBMs = Int(((effectivePlan.trackB.entrySec - origEntryB) * 1000.0).rounded())
-            print(String(format: "[SYNC-LOCK] BeatSnap A:%+dms (%.3fs) | B:%+dms (%.3fs) | Ramp:%.1fs (dur %.1fs)→%.1fs | RateA:%.3fx RateB:%.3fx",
-                         dAMs, effectivePlan.trackA.mixStartSec,
-                         dBMs, effectivePlan.trackB.entrySec,
-                         effectivePlan.trackA.rampStartSec, effectivePlan.sync.rampDurationSec, effectivePlan.trackA.mixStartSec,
+            print(String(format: "[SYNC-LOCK] Plano final | A %.3fs→%.3fs | B %.3fs | Ramp:%.1fs (dur %.1fs) | RateA:%.3fx RateB:%.3fx",
+                         effectivePlan.trackA.mixStartSec, effectivePlan.trackA.mixEndSec, effectivePlan.trackB.entrySec,
+                         effectivePlan.trackA.rampStartSec, effectivePlan.sync.rampDurationSec,
                          effectivePlan.sync.targetRateA, effectivePlan.sync.initialRateB ?? 1.0))
         }
+
+        let incoming = incomingDeck
+        resetDeckNode(incoming)
+        activate(incoming)
 
         let clampedEntry = min(max(effectivePlan.trackB.entrySec, 0), max(totalDur - 4.0, 0))
 
@@ -1075,6 +1230,7 @@ final class AutomixAudioEngine {
         resetTransitionState()
         reportLiveBPM(nil, trend: 0)
         resetDeckNode(activeDeck)
+        activate(activeDeck)
 
         let clamped = min(max(seconds, 0), max(activeDeck.fileDuration - 0.5, 0))
         activeDeck.segmentStartSec = clamped
@@ -1145,26 +1301,61 @@ final class AutomixAudioEngine {
     // MARK: - Loop de Controle a 60 Hz (Rampa de BPM + Trigger Hardware AVAudioTime + Sobreposição + EQ + Filtros DJ)
 
     private func startMonitoring() {
+        scheduleMonitor(every: 1.0 / 20.0)
+    }
+
+    private func scheduleMonitor(every interval: TimeInterval) {
         stopMonitoring()
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.monitorTick()
             }
         }
+        // Tolerância permite ao sistema agrupar os despertares (economiza energia); nas janelas críticas é mínima
+        timer.tolerance = interval > 0.05 ? interval * 0.2 : 0.002
         RunLoop.main.add(timer, forMode: .common)
         monitorTimer = timer
+        monitorInterval = interval
     }
 
     private func stopMonitoring() {
         monitorTimer?.invalidate()
         monitorTimer = nil
+        monitorInterval = 0
+    }
+
+    /// Cadência do monitor conforme o que precisa ser feito:
+    /// - 60 Hz só na janela crítica (último segundo antes da entrada de B, durante a mixagem e na recuperação do BPM),
+    ///   onde o disparo de B e a automação de volume/EQ/filtro precisam de precisão;
+    /// - 20 Hz na aproximação do mix (rampa de BPM da faixa A);
+    /// - o resto do tempo, só `uiUpdateInterval` (acompanhar a posição para a tela e detectar o fim da faixa).
+    private func desiredMonitorInterval() -> TimeInterval {
+        if hasStartedIncoming || hasTriggeredPlayAtFuture || isPreparingIncoming || postTransitionRecoverDuration > 0.05 {
+            return 1.0 / 60.0
+        }
+        let t = lastKnownTime
+        let dur = activeDeck.fileDuration
+        if let plan = transitionPlan, incomingDeck.file != nil {
+            // Mesmo "início seguro" que o tick usa para disparar a Faixa B
+            let mixStart = min(plan.trackA.mixStartSec, max(2.0, dur - 2.0))
+            if t >= mixStart - 1.2 { return 1.0 / 60.0 }
+            if t >= min(plan.trackA.rampStartSec, mixStart) - 9.0 { return 1.0 / 20.0 }
+        } else if dur > 1, t >= dur - 1.5 {
+            return 1.0 / 30.0
+        }
+        return max(uiUpdateInterval, 0.1)
     }
 
     private func resetTransitionState() {
+        prepareGeneration &+= 1
+        isPreparingIncoming = false
         hasStartedIncoming = false
         hasTriggeredPlayAtFuture = false
         transitionPlan = nil
         incomingSongId = nil
+        livePhaseErrorMs = 0
+        isPLLCorrecting = false
+        lastloggedPLLTime = 0
         if postTransitionRecoverDuration <= 0.05 {
             reportLiveBPM(nil, trend: 0)
         }
@@ -1188,6 +1379,14 @@ final class AutomixAudioEngine {
     }
 
     private func monitorTick() {
+        runMonitorTick()
+        // Ajusta a cadência (a menos que o tick tenha parado o monitor, ex.: fim da faixa sem próxima)
+        guard monitorTimer != nil else { return }
+        let desired = desiredMonitorInterval()
+        if abs(desired - monitorInterval) > 0.0005 { scheduleMonitor(every: desired) }
+    }
+
+    private func runMonitorTick() {
         guard isPlaying, engine.isRunning, activeDeck.file != nil else { return }
         if let validA = validRenderTime(for: activeDeck) {
             lastKnownTime = validA
@@ -1201,7 +1400,11 @@ final class AutomixAudioEngine {
         // Se a transição já começou (`hasStartedIncoming`), reporta o tempo e a duração da Música B para a UI!
         let uiDeck = uiReportingDeck
         let uiTime = hasStartedIncoming ? max(incomingLastKnownTime, uiDeck.segmentStartSec) : t
-        onTimeUpdate?(uiTime, uiDeck.fileDuration)
+        let nowAbs = CFAbsoluteTimeGetCurrent()
+        if nowAbs - lastUIEmit >= uiUpdateInterval {
+            lastUIEmit = nowAbs
+            onTimeUpdate?(uiTime, uiDeck.fileDuration)
+        }
 
         // Se a Faixa B acabou de assumir com `initialRateB != 1.0`, volta suavemente para `1.0x` nos primeiros compassos
         if postTransitionRecoverDuration > 0.05 && !hasStartedIncoming {
@@ -1264,7 +1467,7 @@ final class AutomixAudioEngine {
         // 2. Disparo sample-accurate (< 1 ms) da Faixa B com silêncio de pré-rolagem exato em frames:
         //    Inicia ~160 ms antes do downbeat para que ambos os `AVAudioUnitTimePitch` compartilhem o mesmo
         //    lookahead (~75 ms) e as duas batidas saiam no mainMixerNode coladas no mesmo milissegundo.
-        if !hasTriggeredPlayAtFuture {
+        if !hasTriggeredPlayAtFuture && !isPreparingIncoming {
             let timeUntilMixStart = safeMixStart - t
             if timeUntilMixStart <= 0.16 {
                 hasTriggeredPlayAtFuture = true
@@ -1307,10 +1510,57 @@ final class AutomixAudioEngine {
             onTimeUpdate?(currentTime(for: uiDeck), uiDeck.fileDuration)
         }
 
-        // 3. Fase da Mixagem Completa: Curva de Volume (Sobrepor) + EQ Central/3-Bandas + Filtros Passa-Alta/Baixa + Reverb
+        // 3. Fase da Mixagem Completa: Ajustador Automático de Fase em Tempo Real (Beat-Phase Servo PLL a 60 Hz)
+        //    + Curva de Volume (Sobrepor) + EQ Central/3-Bandas + Filtros Passa-Alta/Baixa + Reverb
         if hasStartedIncoming {
             let mixDuration = max(safeMixEnd - safeMixStart, 0.5)
             let p = Float(min(max((t - safeMixStart) / mixDuration, 0.0), 1.0))
+
+            if isBeatmatch {
+                let bpmA = max(plan.trackA.bpm, 60.0)
+                let bpmB = max(plan.trackB.bpm, 60.0)
+                let beatSecA = 60.0 / bpmA
+                let beatSecB = 60.0 / bpmB
+                let tB = incomingLastKnownTime
+                let entryB = incomingDeck.segmentStartSec
+                let baseRateB = Double(max(plan.sync.initialRateB ?? 1.0, 0.5))
+                let wallBeatSecB = beatSecB / baseRateB
+
+                // Erro de fase pela grade: posição sample-accurate de cada deck no próprio arquivo, convertida em
+                // batidas com o BPM exato do servidor (grade constante). Não há re-detecção no áudio: o detector de
+                // "bumbo" por energia de grave travava no baixo com sidechain (~95 ms depois do bumbo) e desalinhava.
+                let beatsElapsedA = (t - safeMixStart) / beatSecA
+                let beatsElapsedB = (tB - entryB) / beatSecB
+                let rawBeatErr = beatsElapsedA - beatsElapsedB
+                let gridBeatErr = rawBeatErr - round(rawBeatErr)
+                let gridErrWallSec = gridBeatErr * wallBeatSecB
+
+                // Nos primeiros 380 ms o playerTime do CoreAudio ainda está saindo do preroll: espera estabilizar.
+                if t - safeMixStart >= 0.38 {
+                    livePhaseErrorMs = gridErrWallSec * 1000.0
+
+                    // Servo proporcional suave (pitch-bend de até ±3.2% no Deck B)
+                    let kp = 0.25
+                    let nudge = min(max(gridBeatErr * kp, -0.032), 0.032)
+                    let correctedRateB = Float(min(max(baseRateB * (1.0 + nudge), 0.88), 1.12))
+                    incomingDeck.timePitch.rate = correctedRateB
+                    isPLLCorrecting = abs(livePhaseErrorMs) >= 3.0
+
+                    if abs(livePhaseErrorMs) >= 5.0 && (t - lastloggedPLLTime) >= 1.2 {
+                        lastloggedPLLTime = t
+                        print(String(format: "[AUTO-SYNC PLL] Corrigindo fase pela grade: erro=%+.1fms → RateB=%.4fx (base %.4fx)",
+                                     livePhaseErrorMs, correctedRateB, baseRateB))
+                    }
+                } else {
+                    incomingDeck.timePitch.rate = Float(baseRateB)
+                    livePhaseErrorMs = 0
+                    isPLLCorrecting = false
+                }
+            } else {
+                livePhaseErrorMs = 0
+                isPLLCorrecting = false
+            }
+
             applyTransitionDSP(progress: p, plan: plan, outgoing: activeDeck, incoming: incomingDeck, primeOnlyIncoming: false)
             onMixProgress?(p)
         }
@@ -1319,7 +1569,10 @@ final class AutomixAudioEngine {
         if hasStartedIncoming && (t >= safeMixEnd || t >= dur - 0.1) {
             let outgoing = activeDeck
             let incoming = incomingDeck
-            let currentRateB = incoming.timePitch.rate
+            // Restaura a taxa base nominal da Faixa B (sem o micro pitch-bend do PLL) antes da rampa de retorno a 1.0x
+            let targetBaseRateB = isBeatmatch ? (plan.sync.initialRateB ?? 1.0) : incoming.timePitch.rate
+            incoming.timePitch.rate = targetBaseRateB
+            let currentRateB = targetBaseRateB
 
             resetDeckNode(outgoing)
             outgoing.file = nil
@@ -1370,8 +1623,12 @@ final class AutomixAudioEngine {
         let volStyle = AutomixVolumeCurve(rawValue: plan.mix.volumeCurve ?? "") ?? .overlap
         let (volA, volB) = computeVolumes(progress: p, curve: volStyle, filterStyle: filterStyle, oneBarFrac: oneBarFrac)
         if !primeOnlyIncoming {
-            outgoing.playerNode.volume = volA
-            incoming.playerNode.volume = volB
+            // Compensação de potência: com A e B em 100% a soma sobe ~3 dB; reduz os dois decks juntos
+            // para manter a potência constante (máx. -3 dB). Em p = 0 e p = 1 o fator volta a 1.0 (sem degrau).
+            let sumPower = volA * volA + volB * volB
+            let overlapTrim: Float = sumPower > 1.0 ? 1.0 / sqrt(sumPower) : 1.0
+            outgoing.playerNode.volume = volA * overlapTrim
+            incoming.playerNode.volume = volB * overlapTrim
         }
 
         // 3. ESTILO DE EQ (Troca de Graves após a Faixa B atingir intensidade plena; evita cortar médios/agudos junto com filtro!)
@@ -1399,64 +1656,58 @@ final class AutomixAudioEngine {
 
         switch curve {
         case .auto, .overlap:
-            // SOBREPOR (3 Fases DJ):
-            // Fase 1 (0.00..0.20): Faixa B sobe rápido até 100% de potência.
-            // Fase 2 (0.20..0.70): AMBAS tocam juntas com a Faixa B em potência total e a Faixa A ainda cheia!
-            // Fase 3 (0.70..1.00): Faixa A sai pelo filtro/efeito em 100% de volume (micro-tail anti-pop só em 0.97..1.0).
-            let vB = p < 0.20 ? sin((p / 0.20) * (.pi / 2.0)) : 1.0
-            let vA: Float = p < 0.97 ? 1.0 : cos(((p - 0.97) / 0.03) * (.pi / 2.0))
+            // SOBREPOR (3 Fases DJ com saída progressiva e musical — NUNCA corte seco no fim!):
+            // Fase 1 (0.00..0.22): Faixa B sobe até 100% de potência.
+            // Fase 2 (0.22..0.66): AMBAS tocam juntas em 100% de potência (convivência plena das duas faixas).
+            // Fase 3 (0.66..1.00): Faixa A desliza suavemente em curva cosseno de 100% até 0% junto com o filtro de saída!
+            let vB = p < 0.22 ? sin((p / 0.22) * (.pi / 2.0)) : 1.0
+            let vA: Float = p < 0.66 ? 1.0 : cos(((p - 0.66) / 0.34) * (.pi / 2.0))
             return (vA, vB)
 
         case .smoothCrossfade:
-            // Último caso (fade cruzado): só reduz volume da A se não houver filtro de saída ativo
-            let vB = p < 0.30 ? sin((p / 0.30) * (.pi / 2.0)) : 1.0
-            let vA: Float = hasOutgoingFilter
-                ? (p < 0.96 ? 1.0 : cos(((p - 0.96) / 0.04) * (.pi / 2.0)))
-                : (p < 0.70 ? 1.0 : cos(((p - 0.70) / 0.30) * (.pi / 2.0)))
+            let vB = p < 0.32 ? sin((p / 0.32) * (.pi / 2.0)) : 1.0
+            let vA: Float = p < 0.60 ? 1.0 : cos(((p - 0.60) / 0.40) * (.pi / 2.0))
             return (vA, vB)
 
         case .fadeInFadeOut:
-            let vB = min(p / 0.25, 1.0)
-            let vA: Float = hasOutgoingFilter
-                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
-                : (p < 0.70 ? 1.0 : max(0.0, 1.0 - ((p - 0.70) / 0.30)))
+            let vB = min(p / 0.28, 1.0)
+            let vA: Float = p < 0.64 ? 1.0 : max(0.0, 1.0 - ((p - 0.64) / 0.36))
             return (vA, vB)
 
         case .cutInFadeOut:
-            // B entra direta a 100% no Beat 1; A segue firme junto e sai pelo filtro no fim
+            // B entra direta a 100% no Beat 1; A segue firme junto e sai em fade suave no terço final (0.66..1.00)
             let r = min(p / 0.025, 1.0)
-            let vA: Float = hasOutgoingFilter
-                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
-                : (p < 0.70 ? 1.0 : max(0.0, 1.0 - ((p - 0.70) / 0.30)))
+            let vA: Float = p < 0.66 ? 1.0 : cos(((p - 0.66) / 0.34) * (.pi / 2.0))
             return (vA, r)
 
         case .fadeInCutOut:
-            // B atinge 100% cedo (0..0.25); A segue firme junto até o corte seco no fim da frase
+            // Mesmo no modo "Corte na saída", faz um decaimento musical rápido no último compasso (0.82..1.00)
+            // em vez de guilhotinar em 0.97..1.00 para nunca parecer erro ou corte seco abrupto!
             let vB = min(p / 0.25, 1.0)
-            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
+            let vA: Float = p < 0.82 ? 1.0 : cos(((p - 0.82) / 0.18) * (.pi / 2.0))
             return (vA, vB)
 
         case .centerCut:
             let vB = p < 0.30 ? min(p / 0.25, 1.0) : 1.0
-            let vA: Float = p < 0.50 ? 1.0 : max(0.0, 1.0 - ((p - 0.50) / 0.04))
+            let vA: Float = p < 0.50 ? 1.0 : cos(((min(p, 0.68) - 0.50) / 0.18) * (.pi / 2.0)) * (p >= 0.68 ? 0.0 : 1.0)
             return (vA, vB)
 
         case .crossfadeQuickOut:
             let vB = min(p / 0.25, 1.0)
-            let vA: Float = hasOutgoingFilter
-                ? (p < 0.96 ? 1.0 : max(0.0, 1.0 - ((p - 0.96) / 0.04)))
-                : (p < 0.72 ? 1.0 : max(0.0, 1.0 - ((p - 0.72) / 0.28)))
+            let vA: Float = p < 0.65 ? 1.0 : cos(((p - 0.65) / 0.35) * (.pi / 2.0))
             return (vA, vB)
 
         case .fadeIn1BarCutOut:
             let vB = min(p / oneBarFrac, 1.0)
-            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
+            let tailFrac = max(0.16, oneBarFrac * 0.85)
+            let startOut = 1.0 - tailFrac
+            let vA: Float = p < startOut ? 1.0 : cos(((p - startOut) / tailFrac) * (.pi / 2.0))
             return (vA, vB)
 
         case .overlap1BarCutOut:
             let startB = max(0.0, 1.0 - oneBarFrac)
             let vB: Float = p < startB ? 0.0 : min((p - startB) / 0.025, 1.0)
-            let vA: Float = p < 0.97 ? 1.0 : max(0.0, 1.0 - ((p - 0.97) / 0.03))
+            let vA: Float = p < 0.84 ? 1.0 : cos(((p - 0.84) / 0.16) * (.pi / 2.0))
             return (vA, vB)
         }
     }
@@ -1524,19 +1775,19 @@ final class AutomixAudioEngine {
 
         case .threeBandTransition:
             // Transição de 3 Bandas (3 Fases DJ):
-            // 1º (0.00..0.35): Agudos, Médios e Graves da B chegam a 100% de potência cedo!
-            // 2º (0.35..0.70): Ambas tocam juntas com a A clara em médios/agudos e B em potência total!
-            // 3º (0.70..1.00): Só no final os médios/agudos da A recuam suavemente junto com o filtro de saída.
-            let lowS = min(max((p - 0.25) / 0.10, 0.0), 1.0)
-            let midInS = min(max((p - 0.08) / 0.22, 0.0), 1.0)
-            let midOutS = min(max((p - 0.70) / 0.28, 0.0), 1.0)
+            // 1º (0.00..0.32): Agudos, Médios e Graves da B chegam a 100% de potência cedo!
+            // 2º (0.32..0.64): Ambas tocam juntas com a A clara em médios/agudos e B em potência total!
+            // 3º (0.64..1.00): Médios e agudos da A recuam de verdade junto com o fade de volume e o filtro de saída.
+            let lowS = min(max((p - 0.24) / 0.10, 0.0), 1.0)
+            let midInS = min(max((p - 0.06) / 0.22, 0.0), 1.0)
+            let midOutS = min(max((p - 0.64) / 0.34, 0.0), 1.0)
             let highInS = min(max(p / 0.16, 0.0), 1.0)
-            let highOutS = min(max((p - 0.76) / 0.22, 0.0), 1.0)
+            let highOutS = min(max((p - 0.70) / 0.28, 0.0), 1.0)
 
             let midCutIn: Float = -10.0
             let highCutIn: Float = -8.0
-            let midCutOut: Float = hasOutgoingFilter ? -4.0 : -12.0
-            let highCutOut: Float = hasOutgoingFilter ? 0.0 : -10.0
+            let midCutOut: Float = hasOutgoingFilter ? -11.0 : -15.0
+            let highCutOut: Float = hasOutgoingFilter ? -9.0 : -13.0
 
             if !primeOnlyIncoming {
                 outBands[0].gain = cutDb * lowS
@@ -1573,19 +1824,19 @@ final class AutomixAudioEngine {
         var inHP: Float? = nil
         var inLP: Float? = nil
 
-        // Fase 1 (0.00..0.25): filtro de entrada da B abre completamente cedo para ela já tocar em potência total!
-        let inSweep = min(max(p / 0.25, 0.0), 1.0)
-        // Fase 2 (0.25..0.70): AMBAS tocam juntas sem filtro na A (convivência plena das duas faixas)!
-        // Fase 3 (0.70..1.00): só no terço final entra o filtro/efeito de saída da Faixa A.
-        let outSweep = min(max((p - 0.70) / 0.30, 0.0), 1.0)
+        // Fase 1 (0.00..0.24): filtro de entrada da B abre completamente cedo para ela já tocar em potência total!
+        let inSweep = min(max(p / 0.24, 0.0), 1.0)
+        // Fase 2 (0.24..0.62): AMBAS tocam juntas sem filtro na A (convivência plena das duas faixas)!
+        // Fase 3 (0.62..1.00): filtro de saída da Faixa A varre profundamente junto com o decaimento de volume.
+        let outSweep = min(max((p - 0.62) / 0.38, 0.0), 1.0)
 
         switch style {
         case .none:
             break
 
         case .lpOut:
-            // Passa-baixa na saída (abafa a Faixa A de 18 kHz até 380 Hz na saída)
-            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
+            // Passa-baixa na saída (abafa a Faixa A de 18 kHz até 280 Hz na saída)
+            outLP = expFreq(from: 18_000, to: 280, t: outSweep)
 
         case .lpIn:
             // Passa-baixa na entrada (Faixa B surge de 380 Hz abrindo até 18 kHz antes do meio)
@@ -1593,15 +1844,15 @@ final class AutomixAudioEngine {
 
         case .lpInLpOut:
             inLP = expFreq(from: 380, to: 18_000, t: inSweep)
-            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
+            outLP = expFreq(from: 18_000, to: 280, t: outSweep)
 
         case .lpInHpOut:
             inLP = expFreq(from: 380, to: 18_000, t: inSweep)
-            outHP = expFreq(from: 25, to: 2_000, t: outSweep)
+            outHP = expFreq(from: 25, to: 2_600, t: outSweep)
 
         case .hpOut:
-            // Passa-alta na saída (Faixa A mantém volume cheio e afina de 25 Hz até 2200 Hz após a B assumir)
-            outHP = expFreq(from: 25, to: 2_200, t: outSweep)
+            // Passa-alta na saída (afina de 25 Hz até 2600 Hz enquanto o volume desce no terço final)
+            outHP = expFreq(from: 25, to: 2_600, t: outSweep)
 
         case .hpIn:
             // Passa-alta na entrada (Faixa B entra limpa em 1100 Hz e desce até 20 Hz antes do meio)
@@ -1609,19 +1860,19 @@ final class AutomixAudioEngine {
 
         case .auto, .hpInHpOut:
             inHP = expFreq(from: 1_000, to: 20, t: inSweep)
-            outHP = expFreq(from: 25, to: 2_200, t: outSweep)
+            outHP = expFreq(from: 25, to: 2_600, t: outSweep)
 
         case .hpInLpOut:
             inHP = expFreq(from: 1_000, to: 20, t: inSweep)
-            outLP = expFreq(from: 18_000, to: 380, t: outSweep)
+            outLP = expFreq(from: 18_000, to: 280, t: outSweep)
 
         case .partialHpOut:
-            // Passa-alta parcial na saída (tira o corpo/médio-grave da A até 680 Hz mantendo vocais/hi-hats limpos)
-            outHP = expFreq(from: 25, to: 680, t: outSweep)
+            // Passa-alta parcial na saída: sobe até 1650 Hz (antes parava em 680 Hz e deixava toda a voz/caixa alta!)
+            outHP = expFreq(from: 25, to: 1_650, t: outSweep)
 
         case .finalNoiseOut:
-            // Saída de ruído final / Wash-out (High-Pass até 2.4 kHz + cauda espacial de Reverb Hall)
-            outHP = expFreq(from: 25, to: 2_400, t: outSweep)
+            // Saída de ruído final / Wash-out (High-Pass até 2.8 kHz + cauda espacial de Reverb Hall)
+            outHP = expFreq(from: 25, to: 2_800, t: outSweep)
             inHP = expFreq(from: 800, to: 20, t: inSweep)
         }
 
@@ -1644,9 +1895,11 @@ final class AutomixAudioEngine {
 
             if useReverbTail && p > 0.45 {
                 let revProgress = min(max((p - 0.45) / 0.55, 0.0), 1.0)
+                if outgoing.reverb.bypass { outgoing.reverb.bypass = false }
                 outgoing.reverb.wetDryMix = revProgress * 58.0
             } else {
                 outgoing.reverb.wetDryMix = 0.0
+                if !outgoing.reverb.bypass { outgoing.reverb.bypass = true }
             }
         }
 
@@ -1666,5 +1919,6 @@ final class AutomixAudioEngine {
             inBands[4].bypass = true
         }
         incoming.reverb.wetDryMix = 0.0
+        if !incoming.reverb.bypass { incoming.reverb.bypass = true }
     }
 }

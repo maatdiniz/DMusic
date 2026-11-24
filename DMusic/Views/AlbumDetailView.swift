@@ -8,7 +8,6 @@ struct AlbumDetailView: View {
     @Environment(DownloadManager.self) private var downloads
     @State private var album: Album?
     @State private var error: String?
-    @State private var showAddToPlaylist = false
 
     private var current: Album { album ?? fallback }
     private var songs: [Song] { album?.song ?? [] }
@@ -56,8 +55,7 @@ struct AlbumDetailView: View {
                             Button {
                                 let entries = headerArtistEntries
                                 if entries.count > 1 {
-                                    player.artistChoices = entries
-                                    player.showArtistPicker = true
+                                    player.presentArtistPicker(entries)
                                 } else if let first = entries.first {
                                     player.navigateToArtistEntry(first)
                                 }
@@ -112,11 +110,11 @@ struct AlbumDetailView: View {
 
                 LazyVStack(spacing: 0) {
                     ForEach(Array(songs.enumerated()), id: \.element.id) { i, s in
-                        Button { player.play(songs: songs, startAt: i, source: .album(current)) } label: {
-                            SongRow(song: s, djContextSongs: songs, djContextSource: .album(current))
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 8)
-                        }.buttonStyle(.plain)
+                        SongRow(song: s, djContextSongs: songs, djContextSource: .album(current), onPlay: {
+                            player.play(songs: songs, startAt: i, source: .album(current))
+                        })
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
                     }
                 }
             }
@@ -124,15 +122,25 @@ struct AlbumDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button { for s in songs.reversed() { player.playNext(s) } } label: { Label("Tocar a seguir", systemImage: "text.insert") }
-                    Button { for s in songs { player.addToQueue(s) } } label: { Label("Adicionar à fila", systemImage: "text.append") }
-                    Button { showAddToPlaylist = true } label: { Label("Adicionar à playlist", systemImage: "music.note.list") }
+                Button {
+                    let all = songs
+                    player.actionMenu = ActionMenuRequest(
+                        header: ActionMenuHeader(
+                            title: current.displayName,
+                            subtitle: ArtistParser.displayString(from: current.artist),
+                            coverArt: current.coverArt,
+                            badges: ["\(all.count) faixas"]
+                        ),
+                        sections: [[
+                            ActionMenuItem(title: "Tocar a seguir", systemImage: "text.insert") { for s in all.reversed() { player.playNext(s) } },
+                            ActionMenuItem(title: "Adicionar à fila", systemImage: "text.append") { for s in all { player.addToQueue(s) } },
+                            ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: all) },
+                        ]]
+                    )
                 } label: { Image(systemName: "ellipsis.circle") }
                 .disabled(songs.isEmpty)
             }
         }
-        .sheet(isPresented: $showAddToPlaylist) { AddToPlaylistSheet(songs: songs) }
         .playerBottomSpace()
         .onAppear { player.visibleDetailId = "album:\(albumId)" }
         .onDisappear { if player.visibleDetailId == "album:\(albumId)" { player.visibleDetailId = nil } }

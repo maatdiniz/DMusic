@@ -53,24 +53,22 @@ struct PlaylistDetailView: View {
                 .buttonStyle(.plain).disabled(songs.isEmpty).padding(.horizontal)
                 LazyVStack(spacing: 0) {
                     ForEach(Array(songs.enumerated()), id: \.offset) { i, s in
-                        Button { player.play(songs: songs, startAt: i, source: .playlist(playlist)) } label: {
-                            SongRow(
-                                song: s,
-                                leading: .cover,
-                                djContextSongs: songs,
-                                djContextSource: .playlist(playlist),
-                                onRemoveFromPlaylist: {
-                                    Task {
-                                        guard let c = auth.client else { return }
-                                        try? await c.removeFromPlaylist(id: playlist.id, index: i)
-                                        songs = (try? await c.playlist(id: playlist.id).entry) ?? songs
-                                    }
+                        SongRow(
+                            song: s,
+                            leading: .cover,
+                            djContextSongs: songs,
+                            djContextSource: .playlist(playlist),
+                            onPlay: { player.play(songs: songs, startAt: i, source: .playlist(playlist)) },
+                            onRemoveFromPlaylist: {
+                                Task {
+                                    guard let c = auth.client else { return }
+                                    try? await c.removeFromPlaylist(id: playlist.id, index: i)
+                                    songs = (try? await c.playlist(id: playlist.id).entry) ?? songs
                                 }
-                            )
-                            .padding(.horizontal)
-                            .padding(.vertical, 6)
-                        }
-                        .buttonStyle(.plain)
+                            }
+                        )
+                        .padding(.horizontal)
+                        .padding(.vertical, 6)
                     }
                 }
             }.padding(.top, 8)

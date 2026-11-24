@@ -14,30 +14,80 @@ nonisolated enum SmartShuffler {
     }
 
     /// Normaliza o título para detectar duplicatas/versões da mesma música
-    /// (ex.: "Control Freak", "Schacke - Control Freak", "Control Freak (Mixed)").
+    /// (ex.: "Control Freak", "Schacke - Control Freak", "Control Freak (Mixed)",
+    /// "01. PETERBLUE - Latin Lovers (Sufriendo Por Ella)" vs "Sufriendo Por Ella").
     static func normalizedTitleKey(_ raw: String, artist: String? = nil) -> String {
+        let keys = normalizedTitleKeys(raw, artist: artist)
+        return keys.first ?? ""
+    }
+
+    /// Retorna todas as chaves canônicas de título de uma faixa (incluindo subtítulo entre parênteses
+    /// quando não for tag de edição) para capturar duplicatas como `"01. PETERBLUE - Latin Lovers (Sufriendo Por Ella)"`
+    /// e `"Sufriendo Por Ella"`.
+    static func normalizedTitleKeys(_ raw: String, artist: String? = nil) -> [String] {
         var s = raw.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
-        // Remove prefixo "Artista - Título" se presente
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Remove numeração inicial de faixa: "01. ", "02 - ", "1. ", etc.
+        if let numMatch = s.range(of: #"^\d{1,3}\s*[\.\-\)]\s*"#, options: .regularExpression) {
+            s = String(s[numMatch.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // 2. Remove prefixo "Artista - Título" se presente
         if let dashRange = s.range(of: " - ") {
             let suffix = String(s[dashRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
             if suffix.count >= 3 {
                 s = suffix
             }
         }
-        // Remove sufixos de edição/qualidade entre parênteses ou colchetes: (Mixed), (Edit), (Mastered), [Remaster], etc.
-        let editionTokens = ["mixed", "edit", "mastered", "remaster", "remastered", "original mix", "extended", "radio", "clean", "explicit", "version", "mix"]
+
+        // 3. Remove sufixos "featuring ...", "feat. ...", "ft. ..."
+        for featToken in [" featuring ", " feat. ", " feat ", " ft. ", " ft "] {
+            if let r = s.range(of: featToken) {
+                let prefix = String(s[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if prefix.count >= 2 {
+                    s = prefix
+                }
+            }
+        }
+
+        // 4. Extrai ou remove sufixos entre parênteses/colchetes:
+        //    - Se for tag de edição ((Mixed), (Edit), (Original Mix), (Bootleg), etc.), descarta.
+        //    - Se for um subtítulo real da música (ex.: "Latin Lovers (Sufriendo Por Ella)"), guarda AMBOS
+        //      (o título principal e o subtítulo) para que nenhuma cópia com o subtítulo toque em seguida!
+        let editionTokens = [
+            "mixed", "edit", "mastered", "remaster", "remastered", "original mix",
+            "extended", "radio", "clean", "explicit", "version", "mix", "bootleg",
+            "remix", "vip", "dub", "club", "instrumental", "acapella", "rework", "flip"
+        ]
+        var altKeys: [String] = []
         while let open = s.lastIndex(where: { $0 == "(" || $0 == "[" }),
               let close = s[open...].firstIndex(where: { $0 == ")" || $0 == "]" }),
               close == s.index(before: s.endIndex) {
             let inner = s[s.index(after: open)..<close].trimmingCharacters(in: .whitespacesAndNewlines)
+            let before = String(s[..<open]).trimmingCharacters(in: .whitespacesAndNewlines)
             if editionTokens.contains(where: { inner.contains($0) }) {
-                s = String(s[..<open]).trimmingCharacters(in: .whitespacesAndNewlines)
+                s = before
             } else {
-                break
+                let innerClean = cleanAlphanumeric(inner)
+                if innerClean.count >= 4 {
+                    altKeys.append(innerClean)
+                }
+                s = before
             }
         }
-        // Mantém apenas letras e números colapsando espaços
-        let cleaned = s.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+
+        let mainClean = cleanAlphanumeric(s)
+        var out: [String] = []
+        if !mainClean.isEmpty { out.append(mainClean) }
+        for k in altKeys where !out.contains(k) {
+            out.append(k)
+        }
+        return out
+    }
+
+    private static func cleanAlphanumeric(_ str: String) -> String {
+        let cleaned = str.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
         return String(cleaned).split(separator: " ").joined(separator: " ")
     }
 
@@ -226,35 +276,42 @@ nonisolated enum SmartShuffler {
             return score
         }
 
-        var bestByTitle: [String: Song] = [:]
-        var orderKeys: [String] = []
-        let anchorKey = anchor.map { normalizedTitleKey($0.title, artist: $0.artist) }
+        var bestByGroup: [String: Song] = [:]
+        var keyToGroup: [String: String] = [:]
+        var orderGroups: [String] = []
 
-        if let anchor, let ak = anchorKey, !ak.isEmpty {
-            bestByTitle[ak] = anchor
-            orderKeys.append(ak)
+        if let anchor {
+            let aKeys = normalizedTitleKeys(anchor.title, artist: anchor.artist)
+            let gId = aKeys.first ?? "__id_\(anchor.id)"
+            bestByGroup[gId] = anchor
+            orderGroups.append(gId)
+            for k in aKeys { keyToGroup[k] = gId }
         }
 
         for song in songs {
             if let anchor, song.id == anchor.id { continue }
-            let key = normalizedTitleKey(song.title, artist: song.artist)
-            guard !key.isEmpty else {
-                bestByTitle["__id_\(song.id)"] = song
-                orderKeys.append("__id_\(song.id)")
+            let keys = normalizedTitleKeys(song.title, artist: song.artist)
+            guard let primaryKey = keys.first, !primaryKey.isEmpty else {
+                let gId = "__id_\(song.id)"
+                bestByGroup[gId] = song
+                orderGroups.append(gId)
                 continue
             }
-            if let existing = bestByTitle[key] {
-                // Nunca substitui a faixa âncora que já está tocando
+
+            if let matchedGroup = keys.compactMap({ keyToGroup[$0] }).first,
+               let existing = bestByGroup[matchedGroup] {
+                for k in keys { keyToGroup[k] = matchedGroup }
                 if let anchor, existing.id == anchor.id { continue }
                 if qualityRank(song) > qualityRank(existing) {
-                    bestByTitle[key] = song
+                    bestByGroup[matchedGroup] = song
                 }
             } else {
-                bestByTitle[key] = song
-                orderKeys.append(key)
+                bestByGroup[primaryKey] = song
+                orderGroups.append(primaryKey)
+                for k in keys { keyToGroup[k] = primaryKey }
             }
         }
-        return orderKeys.compactMap { bestByTitle[$0] }
+        return orderGroups.compactMap { bestByGroup[$0] }
     }
 
     /// Executa algoritmo guloso com consciência de escassez de BPM + Top K controlado + Multi-Start
@@ -690,6 +747,17 @@ nonisolated enum SmartShuffler {
     }
 
     /// Fallback local offline caso o servidor :4534 não responda a tempo para `/api/transition`.
+    /// Ponto da grade `anchor + n·step` (n inteiro) mais próximo de `t` dentro de [lower, upper], ou `nil` se nenhum couber.
+    static func snapToGrid(_ t: Double, anchor: Double, step: Double, lower: Double, upper: Double) -> Double? {
+        guard step > 0.05, upper >= lower else { return nil }
+        let n = ((t - anchor) / step).rounded()
+        for k in [n, n - 1, n + 1] {
+            let candidate = anchor + k * step
+            if candidate >= lower && candidate <= upper { return candidate }
+        }
+        return nil
+    }
+
     static func buildLocalTransitionPlan(
         idA: String,
         metaA: TrackMixMetadata?,
@@ -752,15 +820,31 @@ nonisolated enum SmartShuffler {
         let dual = bestDualRates(bpmA: mA.effectiveBPM, bpmB: mB.effectiveBPM)
         let targetRate = dual.rateA
         let barSecA = (60.0 / max(mA.effectiveBPM, 60.0)) * 4.0
-        let barsCount = (mA.effectiveBPM < 105.0 || safeDurA < 130.0) ? 4 : 8
-        let idealMixDur = min(max(barSecA * Double(barsCount) / Double(targetRate), 6.0), 18.0)
-        let maxMixStart = max(safeDurA * 0.52, safeDurA - idealMixDur - 0.6)
+        var barsCount = (mA.effectiveBPM < 105.0 || safeDurA < 130.0) ? 4 : 8
+        // Mix sempre com número inteiro de compassos no tempo de arquivo de A (dobra se ficar curta demais em BPM alto)
+        if barSecA * Double(barsCount) < 6.0 { barsCount *= 2 }
+        let mixSpanA = barSecA * Double(barsCount)
+        let maxMixStart = max(safeDurA * 0.52, safeDurA - mixSpanA - 0.6)
         let loPct: Double = safeDurA >= 210.0 ? 0.54 : (safeDurA >= 140.0 ? 0.62 : 0.68)
         let fallbackFrac: Double = safeDurA >= 210.0 ? 0.68 : 0.78
-        let preferredOut = (mA.cueOut >= safeDurA * loPct && mA.cueOut <= safeDurA * 0.89)
+        let cueOutUsable = mA.cueOut >= safeDurA * loPct && mA.cueOut <= safeDurA * 0.89
+        let preferredOut = cueOutUsable
             ? mA.cueOut
-            : (safeDurA > 90.0 ? safeDurA * fallbackFrac : safeDurA - idealMixDur - 0.6)
-        let mixStart = min(maxMixStart, max(safeDurA * loPct, preferredOut))
+            : (safeDurA > 90.0 ? safeDurA * fallbackFrac : safeDurA - mixSpanA - 0.6)
+        let rawMixStart = min(maxMixStart, max(safeDurA * loPct, preferredOut))
+
+        // Alinha a saída à grade de A (o 1º beat `cueIn` é tomado como tempo 1 do compasso 1):
+        // - ponto da análise intacto → compasso mais próximo (preserva a seção detectada);
+        // - ponto estimado por porcentagem → início de frase de 8 compassos (32 batidas) mais próximo, como no rekordbox.
+        let snapLower = safeDurA * 0.45
+        let phraseSnapped: Double = {
+            if cueOutUsable && abs(rawMixStart - mA.cueOut) < 0.001 {
+                return snapToGrid(rawMixStart, anchor: mA.cueIn, step: barSecA, lower: snapLower, upper: maxMixStart)
+            }
+            return snapToGrid(rawMixStart, anchor: mA.cueIn, step: barSecA * 8.0, lower: snapLower, upper: maxMixStart)
+                ?? snapToGrid(rawMixStart, anchor: mA.cueIn, step: barSecA, lower: snapLower, upper: maxMixStart)
+        }() ?? rawMixStart
+        let mixStart = phraseSnapped
 
         let rateDelta = Double(abs(targetRate - 1.0))
         let totalLeadBars: Double
@@ -787,8 +871,13 @@ nonisolated enum SmartShuffler {
             rampDur = desiredLead >= 8.0 * barSecA ? desiredLead * 0.50 : desiredLead
         }
 
-        let safeEntryB = min(max(0.0, mB.cueIn), 36.0)
-        let mixEnd = min(safeDurA - 0.15, mixStart + idealMixDur)
+        // Entrada de B no 1º beat; se ele vier depois de 36 s, recua em compassos inteiros de B (continua no tempo 1)
+        let barSecB = mB.beatPeriod * 4.0
+        let firstBeatB = max(0.0, mB.cueIn)
+        let safeEntryB = firstBeatB <= 36.0
+            ? firstBeatB
+            : max(0.0, firstBeatB - ceil((firstBeatB - 36.0) / barSecB) * barSecB)
+        let mixEnd = min(safeDurA - 0.15, mixStart + mixSpanA)
 
         return TransitionPlan(
             transitionType: "beatmatch",
@@ -797,7 +886,7 @@ nonisolated enum SmartShuffler {
             trackB: TrackBTiming(id: idB, bpm: mB.effectiveBPM, entrySec: safeEntryB),
             sync: SyncConfig(targetRateA: targetRate, initialRateB: dual.rateB, rampDurationSec: rampDur),
             mix: MixConfig(
-                durationSec: max(2.0, mixEnd - mixStart),
+                durationSec: max(2.0, (mixEnd - mixStart) / Double(targetRate)),
                 bars: barsCount,
                 volumeCurve: AutomixVolumeCurve.overlap.rawValue,
                 eqStyle: AutomixEQStyle.threeBandTransition.rawValue,

@@ -55,6 +55,11 @@ final class DownloadManager {
             let dest = dir.appendingPathComponent(name)
             try? FileManager.default.removeItem(at: dest)
             try FileManager.default.moveItem(at: tmp, to: dest)
+            // Arquivo vazio ou todo zerado: descarta em vez de salvar um download inutilizável
+            if RecentSongsCache.isCorruptAudioFile(dest) {
+                try? FileManager.default.removeItem(at: dest)
+                throw SubsonicError.badResponse
+            }
             if let cover = song.coverArt {   // guarda as capas em disco para uso offline
                 for size in [100, 300, 600] { _ = await ImageCache.shared.image(id: cover, size: size, client: client) }
             }

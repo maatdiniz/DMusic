@@ -23,15 +23,16 @@ nonisolated enum VolumeCompensationLevel: String, CaseIterable, Identifiable, Se
         case .off:
             return "Reproduz cada música no volume original do arquivo, sem compensação de ganho."
         case .low:
-            return "Baixo (-16 dBFS): preserva ao máximo a dinâmica original, corrigindo apenas diferenças grandes entre faixas. Ideal para fones e audição Hi‑Fi."
+            return "Baixo (-16 LUFS): preserva ao máximo a dinâmica original, corrigindo apenas diferenças grandes entre faixas. Ideal para fones e audição Hi‑Fi."
         case .medium:
-            return "Médio (-14 dBFS): padrão equilibrado para streaming e mixagem DJ. Nivela bem faixas antigas e modernas mantendo margem limpa contra distorção."
+            return "Médio (-14 LUFS): padrão equilibrado para streaming e mixagem DJ. Nivela bem faixas antigas e modernas mantendo margem limpa contra distorção."
         case .high:
-            return "Alto (-11 dBFS): aproxima faixas mais baixas do volume máximo das produções modernas (protegido contra clipping). Pode reduzir a sensação de dinâmica em músicas muito calmas."
+            return "Alto (-11 LUFS): aproxima faixas mais baixas do volume máximo das produções modernas (protegido contra clipping). Pode reduzir a sensação de dinâmica em músicas muito calmas."
         }
     }
 
-    var targetDBFS: Float {
+    /// Loudness integrada alvo (LUFS, ITU-R BS.1770)
+    var targetLUFS: Float {
         switch self {
         case .off: return -14.0
         case .low: return -16.0

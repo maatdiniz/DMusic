@@ -18,14 +18,14 @@ struct AutomixGuideView: View {
                 GuideColorRow(
                     color: purple,
                     icon: "arrowtriangle.up.fill",
-                    badge: "SINC",
+                    badge: "SYNC",
                     title: "Aumentando BPM (Barra + Prato)",
                     detail: "O trecho roxo no final da barra de tempo indica onde a faixa atual acelera até alcançar o BPM da próxima música."
                 )
                 GuideColorRow(
                     color: coral,
                     icon: "arrowtriangle.down.fill",
-                    badge: "SINC",
+                    badge: "SYNC",
                     title: "Reduzindo BPM (Barra + Prato)",
                     detail: "O trecho coral no final da barra mostra onde a faixa atual desacelera até igualar o andamento da próxima."
                 )
@@ -39,14 +39,14 @@ struct AutomixGuideView: View {
                 GuideColorRow(
                     color: green,
                     icon: "equal",
-                    badge: "SINC",
+                    badge: "SYNC",
                     title: "Verde (Reproduzindo / Estável)",
                     detail: "Indica reprodução normal ou que o BPM já parou de variar e está cravado."
                 )
                 GuideColorRow(
                     color: armedBlue,
                     icon: "waveform",
-                    badge: "SINC 2:45",
+                    badge: "SYNC 2:45",
                     title: "Transição Armada",
                     detail: "Badge discreto mostrando o minuto exato em que a próxima música vai entrar."
                 )

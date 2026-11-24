@@ -28,7 +28,12 @@ final class AudioPlayerManager {
     var duration: Double = 0
     var shuffle = false
     var repeatMode: RepeatMode = .off
-    var showNowPlaying = false
+    var showNowPlaying = false {
+        // Com o player fechado ninguém vê a barra andar: atualiza a posição com bem menos frequência
+        didSet { automixEngine.uiUpdateInterval = showNowPlaying ? 0.1 : 0.5 }
+    }
+    @ObservationIgnored private var lastNowPlayingSync: CFAbsoluteTime = 0
+    @ObservationIgnored private var lastStateSave: CFAbsoluteTime = 0
     var playbackSource: PlaybackSource?
     var selectedTab: AppTab = .home
     var homePath = NavigationPath()
@@ -38,8 +43,6 @@ final class AudioPlayerManager {
     var requestedSearchQuery: String?
     var searchFocusTrigger: Int = 0
     var visibleDetailId: String?
-    var artistChoices: [ArtistParser.Entry] = []
-    var showArtistPicker = false
 
     /// Automix automático (sincroniza BPM com rampa na Faixa A antes da entrada,
     /// dispara Faixa B no downbeat via AVAudioEngine + Bass Swap e usa SmartShuffler).
@@ -65,7 +68,7 @@ final class AudioPlayerManager {
     }
     var automixPhaseLabel: String?
     var preparedMixHint: String?
-    /// Badge curto, discreto e colorido exibido na tela de reprodução (ex.: "SINC ↑", "SINC ↓", "MIX • 3B", "MIX • EQ").
+    /// Badge curto, discreto e colorido exibido na tela de reprodução (ex.: "SYNC ↑", "SYNC ↓", "MIX • 3B", "MIX • EQ").
     var automixBadge: AutomixIndicatorBadge?
     /// Plano de transição armado para a faixa atual (usado para limitar o slider antes da transição e colorir a zona de rampa de BPM).
     var activeTransitionPlan: TransitionPlan?
@@ -86,6 +89,69 @@ final class AudioPlayerManager {
     @ObservationIgnored private var djSettleSafetyTask: Task<Void, Never>?
     var isAutomixing: Bool { automixPhaseLabel != nil }
 
+    // MARK: Menus de ação (painel único na raiz do app)
+
+    /// Menu de ações aberto no momento (faixa, álbum, opções do player…); `nil` = fechado.
+    var actionMenu: ActionMenuRequest?
+    /// Seletor de playlist, aberto depois que o menu fecha.
+    var playlistPicker: PlaylistPickerRequest?
+
+    /// Abre o seletor de playlist com uma pequena espera, para não colidir com o painel de menu que está fechando.
+    func presentPlaylistPicker(for songs: [Song]) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(380))
+            self?.playlistPicker = PlaylistPickerRequest(songs: songs)
+        }
+    }
+
+    // MARK: Indicador de carregamento (quadrado de reticências)
+
+    /// Texto do indicador global de carregamento; `nil` quando nada pesado está em andamento.
+    var busyMessage: String?
+    @ObservationIgnored private var busyEntries: [(id: UUID, message: String)] = []
+    @ObservationIgnored private var queueBuildTask: Task<Void, Never>?
+    @ObservationIgnored private var reorderTask: Task<Void, Never>?
+
+    /// Mostra o indicador até `endBusy` ser chamado com o token devolvido (vários trabalhos podem se sobrepor).
+    @discardableResult
+    func beginBusy(_ message: String) -> UUID {
+        let id = UUID()
+        busyEntries.append((id, message))
+        busyMessage = message
+        return id
+    }
+
+    func endBusy(_ token: UUID) {
+        busyEntries.removeAll { $0.id == token }
+        busyMessage = busyEntries.last?.message
+    }
+
+    /// Executa `work` mostrando o indicador de carregamento enquanto durar.
+    func withBusy<T>(_ message: String, _ work: () async -> T) async -> T {
+        let token = beginBusy(message)
+        defer { endBusy(token) }
+        return await work()
+    }
+
+    /// Smart Shuffle + relatório calculados fora da thread principal.
+    nonisolated private static func smartOrder(
+        songs: [Song],
+        metadata: [String: TrackMixMetadata],
+        anchor: Song?
+    ) -> (queue: [Song], report: SmartShuffleRunLog) {
+        let ordered = SmartShuffler.smartShuffle(songs: songs, metadata: metadata, startingWith: anchor)
+        return (ordered, SmartShuffler.buildShuffleReport(orderedSongs: ordered, metadata: metadata))
+    }
+
+    private func publishSmartShuffleLog(_ report: SmartShuffleRunLog, reason: String) {
+        lastSmartShuffleLog = report
+        logEvent(
+            .shuffle,
+            "\(reason) (\(report.totalTracks) faixas • média \(Int(report.averageScore.rounded())) pts)",
+            detail: "IA allin1: \(report.aiAnalyzedCount) • Local: \(report.localAnalyzedCount) • Sem análise: \(report.unanalyzedCount)"
+        )
+    }
+
     private func resetDJStage(clearLiveBPM: Bool = true) {
         djSettleSafetyTask?.cancel()
         djSettleSafetyTask = nil
@@ -105,6 +171,30 @@ final class AudioPlayerManager {
     func finishDJStageSettling() {
         guard djStageMode == .settling else { return }
         resetDJStage(clearLiveBPM: false)
+    }
+
+    /// Snapshot instantâneo O(1) dos dois decks para o Espectrograma Rekordbox a 60 FPS.
+    func liveDeckSnapshot() -> AutomixAudioEngine.LiveDeckSnapshot {
+        if usingEngineMode {
+            return automixEngine.liveDeckSnapshot()
+        }
+        let curId = currentSong?.id
+        let bpmA = curId.flatMap { analysisStore?.metadata(for: $0)?.effectiveBPM } ?? 0
+        return AutomixAudioEngine.LiveDeckSnapshot(
+            songIdA: curId,
+            timeA: currentTime,
+            durationA: duration,
+            rateA: 1.0,
+            nominalBPMA: bpmA,
+            songIdB: nil,
+            timeB: 0,
+            durationB: 0,
+            rateB: 1.0,
+            nominalBPMB: 0,
+            hasStartedIncoming: false,
+            phase: .playing,
+            plan: nil
+        )
     }
 
     /// Fim visível da barra de progresso: no modo DJ (`shouldUseAutomix`) com transição armada, vai exatamente até o início da transição (`mixStartSec`).
@@ -177,7 +267,6 @@ final class AudioPlayerManager {
     @ObservationIgnored var settings: CacheSettings?
     @ObservationIgnored var analysisStore: TrackAnalysisStore?
     @ObservationIgnored private var restored = false
-    @ObservationIgnored private var saveTick = 0
     @ObservationIgnored private var sleepTask: Task<Void, Never>?
     /// Sleep timer: horário em que a música vai pausar (nil = desligado).
     var sleepEnd: Date?
@@ -241,6 +330,21 @@ final class AudioPlayerManager {
         setupAutomixEngineCallbacks()
     }
 
+    /// Tarefas periódicas baratas e espaçadas por tempo (não por tick): o Centro de Controle extrapola a posição sozinho
+    /// (taxa de reprodução + tempo decorrido), então só precisa ser ressincronizado de vez em quando; o estado da fila
+    /// é gravado a cada 15 s.
+    private func periodicHousekeeping() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastNowPlayingSync >= 15 {
+            lastNowPlayingSync = now
+            updateNowPlayingProgress()
+        }
+        if now - lastStateSave >= 15 {
+            lastStateSave = now
+            saveState()
+        }
+    }
+
     private func setupGaplessPlayer() {
         gaplessPlayer.actionAtItemEnd = .advance
         gaplessPlayer.automaticallyWaitsToMinimizeStalling = true
@@ -255,12 +359,10 @@ final class AudioPlayerManager {
                 let sec = t.seconds.isFinite ? t.seconds : 0
                 self.currentTime = sec
                 self.trackListening(sec)
-                self.saveTick += 1
-                if self.saveTick % 40 == 0 { self.saveState() }
+                self.periodicHousekeeping()
                 if let d = self.gaplessPlayer.currentItem?.duration.seconds, d.isFinite, d > 0 {
                     self.duration = d
                 }
-                self.updateNowPlayingProgress()
             }
         }
 
@@ -297,9 +399,7 @@ final class AudioPlayerManager {
             self.currentTime = t
             if dur > 0 { self.duration = dur }
             self.trackListening(t)
-            self.saveTick += 1
-            if self.saveTick % 240 == 0 { self.saveState() }
-            self.updateNowPlayingProgress()
+            self.periodicHousekeeping()
         }
 
         automixEngine.onPhaseChanged = { [weak self] phase, plan in
@@ -313,14 +413,14 @@ final class AudioPlayerManager {
             case .ramping:
                 let rateA = plan?.sync.targetRateA ?? 1.0
                 if rateA > 1.003 {
-                    self.automixPhaseLabel = "SINC ↑"
-                    self.automixBadge = AutomixIndicatorBadge(text: "SINC", icon: "arrowtriangle.up.fill", kind: .syncUp)
+                    self.automixPhaseLabel = "SYNC ↑"
+                    self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "arrowtriangle.up.fill", kind: .syncUp)
                 } else if rateA < 0.997 {
-                    self.automixPhaseLabel = "SINC ↓"
-                    self.automixBadge = AutomixIndicatorBadge(text: "SINC", icon: "arrowtriangle.down.fill", kind: .syncDown)
+                    self.automixPhaseLabel = "SYNC ↓"
+                    self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "arrowtriangle.down.fill", kind: .syncDown)
                 } else {
-                    self.automixPhaseLabel = "SINC"
-                    self.automixBadge = AutomixIndicatorBadge(text: "SINC", icon: "equal", kind: .syncSteady)
+                    self.automixPhaseLabel = "SYNC"
+                    self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "equal", kind: .syncSteady)
                 }
                 self.djSettleSafetyTask?.cancel()
                 let nextSongForStage = plan.flatMap { p in self.queue.first(where: { $0.id == p.trackB.id }) } ?? self.nextSongInQueue
@@ -376,8 +476,8 @@ final class AudioPlayerManager {
                 self.djDeckABPM = bpm
                 if trend == 0, let p = self.activeTransitionPlan,
                    p.transitionType == "beatmatch", abs(p.sync.targetRateA - 1.0) >= 0.003 {
-                    self.automixPhaseLabel = "SINC"
-                    self.automixBadge = AutomixIndicatorBadge(text: "SINC", icon: "equal", kind: .syncSteady)
+                    self.automixPhaseLabel = "SYNC"
+                    self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "equal", kind: .syncSteady)
                 }
             } else if self.djStageMode == .mixing, let bpm {
                 self.djDeckABPM = bpm
@@ -574,20 +674,32 @@ final class AudioPlayerManager {
             gaplessPlayer.volume = 1.0
             return
         }
-        let gainDB: Float
-        if let localURL = localFileURL(for: song.id),
-           let measured = AutomixAudioEngine.measureLoudness(url: localURL) {
-            gainDB = AutomixAudioEngine.computeGainDB(rmsDB: measured.rmsDB, peakDB: measured.peakDB, level: lvl)
+        // AVQueuePlayer só atenua (<= 1.0), então normalizamos com teto em 1.0 quando está em Gapless
+        func applyGain(_ gainDB: Float) {
+            let linear = pow(10.0, gainDB / 20.0)
+            gaplessPlayer.volume = min(max(linear, 0.35), 1.0)
+        }
+        if let localURL = localFileURL(for: song.id) {
+            let songId = song.id
+            if let cached = LoudnessCache.shared.get(songId) {
+                applyGain(AutomixAudioEngine.computeGainDB(lufs: cached.lufs, peakDB: cached.peakDB, level: lvl))
+                return
+            }
+            // A medição LUFS decodifica ~40 s de áudio (uma vez por faixa; depois fica no cache em disco)
+            Task { [weak self] in
+                let measured = await Task.detached(priority: .utility) { AutomixAudioEngine.measureLoudness(url: localURL) }.value
+                guard let measured else { return }
+                LoudnessCache.shared.set(songId, lufs: measured.lufs, peakDB: measured.peakDB)
+                guard let self, self.currentSong?.id == songId else { return }
+                applyGain(AutomixAudioEngine.computeGainDB(lufs: measured.lufs, peakDB: measured.peakDB, level: lvl))
+            }
         } else if let energy = analysisStore?.metadata(for: song.id)?.energy, energy > 0.05 {
             let estRMS = Float(max(energy * 0.38, 0.02))
             let estDB = 20.0 * log10(estRMS)
-            gainDB = AutomixAudioEngine.computeGainDB(rmsDB: estDB, peakDB: -1.0, level: lvl)
+            applyGain(AutomixAudioEngine.computeGainDB(lufs: estDB, peakDB: -1.0, level: lvl))
         } else {
-            gainDB = 0.0
+            applyGain(0.0)
         }
-        // AVQueuePlayer só atenua (<= 1.0), então normalizamos com teto em 1.0 quando está em Gapless
-        let linear = pow(10.0, gainDB / 20.0)
-        gaplessPlayer.volume = min(max(linear, 0.35), 1.0)
     }
 
     /// Reativa o Modo DJ e reorganiza a fila inteira a partir da música que está tocando agora (sem interromper o áudio).
@@ -605,41 +717,74 @@ final class AudioPlayerManager {
         var seen: Set<String> = [current.id]
         seen.formUnion(priorityIds)
         let remaining = poolSource.filter { seen.insert($0.id).inserted }
-
-        if let store = analysisStore, !remaining.isEmpty {
-            let anchor = prioritySongs.last ?? current
-            let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + remaining, metadata: store.items, startingWith: anchor).dropFirst()
-            queue = [current] + prioritySongs + Array(smartTail)
-            currentIndex = 0
-            playbackSource = .djMix(seedTitle: current.title)
-            recordSmartShuffleLog(songs: queue, reason: "Modo DJ reorganizado a partir de \(current.title)")
-            queueChanged()
-        } else if !remaining.isEmpty {
-            queue = [current] + prioritySongs + remaining.shuffled()
-            currentIndex = 0
-            playbackSource = .djMix(seedTitle: current.title)
-            queueChanged()
+        guard !remaining.isEmpty else {
+            syncMetadataAndRefreshShuffleIfNeeded(source: playbackSource, originalCount: originalQueue.count)
+            return
         }
-        syncMetadataAndRefreshShuffleIfNeeded(source: playbackSource, originalCount: originalQueue.count)
+
+        let anchor = prioritySongs.last ?? current
+        let metadata = analysisStore?.items
+        let token = beginBusy("Reorganizando a fila do Mix DJ")
+        reorderTask?.cancel()
+        reorderTask = Task { [weak self] in
+            var smartTail: [Song]?
+            var report: SmartShuffleRunLog?
+            if let metadata {
+                let result = await Task.detached(priority: .userInitiated) {
+                    Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor)
+                }.value
+                smartTail = Array(result.queue.dropFirst())
+                report = result.report
+            }
+            guard let self else { return }
+            self.endBusy(token)
+            guard !Task.isCancelled, self.currentSong?.id == current.id else { return }
+            self.queue = [current] + prioritySongs + (smartTail ?? remaining.shuffled())
+            self.currentIndex = 0
+            self.playbackSource = .djMix(seedTitle: current.title)
+            if let report { self.publishSmartShuffleLog(report, reason: "Modo DJ reorganizado a partir de \(current.title)") }
+            self.queueChanged()
+            self.syncMetadataAndRefreshShuffleIfNeeded(source: self.playbackSource, originalCount: self.originalQueue.count)
+        }
     }
 
     // MARK: Playback control
 
     func play(songs: [Song], startAt index: Int = 0, source: PlaybackSource? = nil) {
         guard !songs.isEmpty, songs.indices.contains(index) else { return }
+        queueBuildTask?.cancel()
+        let chosen = songs[index]
+
+        // Mix DJ: o Smart Shuffle (centenas de faixas, vários candidatos) roda fora da thread principal;
+        // a interface continua responsiva e mostra o indicador de carregamento.
+        if shuffle, automixEnabled, let store = analysisStore {
+            let metadata = store.items
+            let token = beginBusy("Montando a fila do Mix DJ")
+            queueBuildTask = Task { [weak self] in
+                let result = await Task.detached(priority: .userInitiated) {
+                    Self.smartOrder(songs: songs, metadata: metadata, anchor: chosen)
+                }.value
+                guard let self else { return }
+                self.endBusy(token)
+                guard !Task.isCancelled else { return }
+                self.playbackSource = source
+                self.originalQueue = songs
+                self.priorityCount = 0
+                self.queue = result.queue
+                self.publishSmartShuffleLog(result.report, reason: "Play com Smart Shuffle")
+                self.load(index: 0)
+                self.syncMetadataAndRefreshShuffleIfNeeded(source: source, originalCount: songs.count)
+            }
+            return
+        }
+
         playbackSource = source
         originalQueue = songs
         priorityCount = 0
         if shuffle {
-            let chosen = songs[index]
-            if automixEnabled, let store = analysisStore {
-                queue = SmartShuffler.smartShuffle(songs: songs, metadata: store.items, startingWith: chosen)
-                recordSmartShuffleLog(songs: queue, reason: "Play com Smart Shuffle")
-            } else {
-                var rest = songs
-                rest.remove(at: index)
-                queue = [chosen] + rest.shuffled()
-            }
+            var rest = songs
+            rest.remove(at: index)
+            queue = [chosen] + rest.shuffled()
             load(index: 0)
         } else {
             queue = songs
@@ -652,20 +797,34 @@ final class AudioPlayerManager {
 
     func playAll(_ songs: [Song], shuffled: Bool = false, source: PlaybackSource? = nil) {
         guard !songs.isEmpty else { return }
+        queueBuildTask?.cancel()
+        shuffle = shuffled
+
+        if shuffled, automixEnabled, let store = analysisStore {
+            let metadata = store.items
+            let token = beginBusy("Montando a fila do Mix DJ")
+            queueBuildTask = Task { [weak self] in
+                let result = await Task.detached(priority: .userInitiated) {
+                    Self.smartOrder(songs: songs, metadata: metadata, anchor: nil)
+                }.value
+                guard let self else { return }
+                self.endBusy(token)
+                guard !Task.isCancelled else { return }
+                self.playbackSource = source
+                self.originalQueue = songs
+                self.priorityCount = 0
+                self.queue = result.queue
+                self.publishSmartShuffleLog(result.report, reason: "Play All com Smart Shuffle")
+                self.load(index: 0)
+                self.syncMetadataAndRefreshShuffleIfNeeded(source: source, originalCount: songs.count)
+            }
+            return
+        }
+
         playbackSource = source
         originalQueue = songs
-        shuffle = shuffled
         priorityCount = 0
-        if shuffled {
-            if automixEnabled, let store = analysisStore {
-                queue = SmartShuffler.smartShuffle(songs: songs, metadata: store.items)
-                recordSmartShuffleLog(songs: queue, reason: "Play All com Smart Shuffle")
-            } else {
-                queue = songs.shuffled()
-            }
-        } else {
-            queue = songs
-        }
+        queue = shuffled ? songs.shuffled() : songs
         load(index: 0)
         if automixEnabled {
             syncMetadataAndRefreshShuffleIfNeeded(source: source, originalCount: songs.count)
@@ -687,6 +846,8 @@ final class AudioPlayerManager {
             startDJMix(startingWith: song, in: [song], source: .djMix(seedTitle: song.title))
             return
         }
+        let token = beginBusy("Buscando a biblioteca completa")
+        defer { endBusy(token) }
         async let syncTask: Void = {
             await self.analysisStore?.syncFromServerIfStale(mixClient: self.mixClient)
         }()
@@ -766,6 +927,23 @@ final class AudioPlayerManager {
         if priorityCount > 0, index == currentIndex + 1 { priorityCount -= 1 } else { priorityCount = 0 }
     }
 
+    /// Abre o arquivo local da faixa para o AVAudioEngine. Se o arquivo do cache recente estiver corrompido
+    /// (ex.: download todo zerado), remove do cache para ser baixado de novo e registra no log do Automix.
+    private func openEngineFile(for songId: String) -> AVAudioFile? {
+        guard let url = localFileURL(for: songId) else { return nil }
+        if let file = try? AVAudioFile(forReading: url), AutomixAudioEngine.canPlay(file: file) {
+            return file
+        }
+        guard RecentSongsCache.isCorruptAudioFile(url) else { return nil }
+        if downloads?.isDownloaded(songId) == true {
+            logEvent(.engine, "Download corrompido", detail: "\(url.lastPathComponent) está zerado/vazio — remova e baixe a faixa novamente.")
+        } else {
+            recents?.evict(id: songId)
+            logEvent(.engine, "Cache corrompido removido", detail: "\(url.lastPathComponent) estava zerado/vazio e será baixado novamente.")
+        }
+        return nil
+    }
+
     func localFileURL(for songId: String) -> URL? {
         downloads?.localURL(for: songId) ?? recents?.localURL(for: songId)
     }
@@ -816,9 +994,7 @@ final class AudioPlayerManager {
         }
 
         if shouldUseAutomix,
-           let localURL = localFileURL(for: song.id),
-           let audioFile = try? AVAudioFile(forReading: localURL),
-           AutomixAudioEngine.canPlay(file: audioFile) {
+           let audioFile = openEngineFile(for: song.id) {
             usingEngineMode = true
             automixEngine.volumeCompensation = settings?.volumeCompensation ?? .off
             automixEngine.startPlaying(file: audioFile, songId: song.id, startAtSec: 0, autoplay: autoplay)
@@ -869,8 +1045,7 @@ final class AudioPlayerManager {
                 }
                 guard !Task.isCancelled, currentSong?.id == song.id else { return }
                 if let localA = localFileURL(for: song.id),
-                   let fileA = try? AVAudioFile(forReading: localA),
-                   AutomixAudioEngine.canPlay(file: fileA) {
+                   let fileA = openEngineFile(for: song.id) {
                     _ = await analysisStore?.ensureAnalyzed(songId: song.id, localURL: localA)
                     guard !Task.isCancelled, currentSong?.id == song.id, shouldUseAutomix else { return }
                     let posSec = currentTime
@@ -914,9 +1089,7 @@ final class AudioPlayerManager {
     private func onAutomixEnabledMidTrack() {
         guard let song = currentSong else { return }
         if !usingEngineMode {
-            if let localA = localFileURL(for: song.id),
-               let fileA = try? AVAudioFile(forReading: localA),
-               AutomixAudioEngine.canPlay(file: fileA) {
+            if let fileA = openEngineFile(for: song.id) {
                 let posSec = currentTime
                 let wasPlaying = isPlaying
                 gaplessPlayer.pause()
@@ -955,14 +1128,14 @@ final class AudioPlayerManager {
     private func applyUserAutomixOverrides(to rawPlan: TransitionPlan) -> TransitionPlan {
         var plan = rawPlan
 
-        // Curva de Volume: por padrão ("auto") usa o que o servidor sugeriu ou "overlap" (Sobrepor)
+        // No modo "auto" o app executa exatamente o que o servidor decidiu (curva, EQ, filtro e pontos de mix);
+        // só as escolhas explícitas do usuário nos ajustes substituem o plano.
         if automixVolumeCurve != .auto {
             plan.mix.volumeCurve = automixVolumeCurve.rawValue
         } else if (plan.mix.volumeCurve ?? "").isEmpty {
             plan.mix.volumeCurve = AutomixVolumeCurve.overlap.rawValue
         }
 
-        // Estilo de EQ: por padrão ("auto") usa o sugerido pelo servidor ou "center_bass_swap" (Troca de Grave central)
         if automixEQStyle != .auto {
             plan.mix.eqStyle = automixEQStyle.rawValue
         } else if (plan.mix.eqStyle ?? "").isEmpty {
@@ -986,31 +1159,53 @@ final class AudioPlayerManager {
             plan.mix.reverbTail = true
         }
 
-        // Se o usuário fixou o número de compassos (2, 4, 8 ou 16) e o plano veio com número diferente (ex.: fallback local),
-        // recalcula a janela proporcionalmente ao BPM da Faixa A
-        if automixDurationChoice != .auto {
-            let targetBars = automixDurationChoice.rawValue
-            if plan.mix.bars != targetBars {
-                let bpmA = max(plan.trackA.bpm, 65.0)
-                let rateA = Double(max(plan.sync.targetRateA, 0.75))
-                let barSecA = 4.0 * 60.0 / bpmA
-                let spanA = barSecA * Double(targetBars)
-                let durA = duration > 0 ? duration : max(plan.trackA.mixEndSec + 10.0, 120.0)
-                let newEnd = min(durA - 0.25, plan.trackA.mixStartSec + spanA)
-                let newStart = max(0.0, newEnd - spanA)
+        // Duração da mix em compassos INTEIROS de A, com o início preso na âncora de frase (`mixStartSec` vem do downbeat
+        // de uma seção do allin1 ou da grade de frases local). Assim a entrada cai no tempo 1 e o fim da mix também.
+        // Se não couber até o fim da faixa, reduz os compassos (16 → 8 → 4 → 2) em vez de tirar o início da frase;
+        // só recua o início (em compassos inteiros) quando nem 2 compassos cabem.
+        // Planos do servidor já vêm em compassos inteiros da grade constante (e com `bars` do usuário aplicado no
+        // próprio servidor via `barsOverride`): só o plano local (offline) precisa deste ajuste.
+        let userFixedBars = automixDurationChoice != .auto
+        if plan.source != "allin1" && (plan.transitionType == "beatmatch" || userFixedBars) {
+            let bpmA = max(plan.trackA.bpm, 65.0)
+            let rateA = Double(max(plan.sync.targetRateA, 0.75))
+            let barSecA = 4.0 * 60.0 / bpmA
+            let durA = duration > 0 ? duration : max(plan.trackA.mixEndSec + 10.0, 120.0)
+            let maxEnd = durA - 0.25
+            let currentSpan = plan.trackA.mixEndSec - plan.trackA.mixStartSec
+            let requestedBars = userFixedBars
+                ? automixDurationChoice.rawValue
+                : (plan.mix.bars ?? max(2, Int((currentSpan / barSecA).rounded())))
+
+            var bars = max(requestedBars, 2)
+            while bars > 2 && plan.trackA.mixStartSec + Double(bars) * barSecA > maxEnd {
+                bars = max(bars / 2, 2)
+            }
+            var newStart = plan.trackA.mixStartSec
+            if newStart + Double(bars) * barSecA > maxEnd {
+                let overflow = newStart + Double(bars) * barSecA - maxEnd
+                newStart = max(0.0, newStart - ceil(overflow / barSecA) * barSecA)
+            }
+            let newEnd = newStart + Double(bars) * barSecA
+
+            let barsChanged = plan.mix.bars != bars
+            let startMoved = abs(newStart - plan.trackA.mixStartSec) > 0.001
+            if barsChanged || startMoved || abs(newEnd - plan.trackA.mixEndSec) > 0.001 {
                 plan.trackA.mixStartSec = newStart
                 plan.trackA.mixEndSec = newEnd
-                if plan.trackA.rampStartSec > newStart - 2.0 * barSecA {
+                if (userFixedBars && barsChanged) || startMoved,
+                   plan.trackA.rampStartSec > newStart - 2.0 * barSecA {
                     plan.trackA.rampStartSec = max(durA * 0.38, newStart - 8.0 * barSecA)
                     if plan.trackA.rampStartSec > newStart {
                         plan.trackA.rampStartSec = max(0.0, newStart - 4.0 * barSecA)
                     }
                 }
+                plan.trackA.rampStartSec = min(plan.trackA.rampStartSec, newStart)
                 if abs(plan.sync.targetRateA - 1.0) >= 0.003 {
                     let availLead = max(0.0, newStart - plan.trackA.rampStartSec)
                     plan.sync.rampDurationSec = min(max(plan.sync.rampDurationSec, min(availLead, 4.0 * barSecA)), availLead)
                 }
-                plan.mix.bars = targetBars
+                plan.mix.bars = bars
                 plan.mix.durationSec = max(2.0, (newEnd - newStart) / rateA)
             }
         }
@@ -1025,9 +1220,15 @@ final class AudioPlayerManager {
         }
         guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
 
-        guard let localB = localFileURL(for: songB.id),
-              let fileB = try? AVAudioFile(forReading: localB),
-              AutomixAudioEngine.canPlay(file: fileB) else {
+        var openedB = openEngineFile(for: songB.id)
+        if openedB == nil, localFileURL(for: songB.id) == nil {
+            // O arquivo estava corrompido e saiu do cache: baixa de novo antes de desistir do mix
+            await recents?.cache(songB, protecting: protecting, forceForAutomix: true)
+            guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
+            openedB = openEngineFile(for: songB.id)
+        }
+        guard let fileB = openedB, let localB = localFileURL(for: songB.id) else {
+            logEvent(.engine, "Mix não armado: \(songB.title)", detail: "O arquivo local da próxima faixa não pôde ser aberto pelo AVAudioEngine (formato não suportado ou download falhou).")
             return
         }
 
@@ -1054,9 +1255,9 @@ final class AudioPlayerManager {
 
         var plan = applyUserAutomixOverrides(to: rawPlan)
 
-        // Verifica o BPM real local no PCM das duas faixas (em background) para corrigir arredondamentos
-        // do servidor/allin1 (ex.: 145.3 vs 148.3 BPM enviados como 1.000x)
-        if plan.transitionType == "beatmatch", let localA = localFileURL(for: songA.id) {
+        // Plano local (offline): confere o BPM real no PCM das duas faixas, porque a análise local é aproximada.
+        // Planos do servidor já trazem o BPM exato da grade constante e são executados sem alteração.
+        if plan.transitionType == "beatmatch", plan.source != "allin1", let localA = localFileURL(for: songA.id) {
             let basePlan = plan
             plan = await Task.detached(priority: .userInitiated) {
                 AutomixAudioEngine.refineTransitionPlanWithTrueBPM(plan: basePlan, urlA: localA, urlB: localB)
@@ -1068,7 +1269,9 @@ final class AudioPlayerManager {
             _ = await ImageCache.shared.image(id: coverB, size: 600, client: client)
         }
         guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
-        let resolvedPlan = automixEngine.prepareIncoming(fileB: fileB, songId: songB.id, plan: plan) ?? plan
+        let preparedPlan = await automixEngine.prepareIncoming(fileB: fileB, songId: songB.id, plan: plan)
+        guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
+        let resolvedPlan = preparedPlan ?? plan
         activeTransitionPlan = resolvedPlan
 
         let outStr = Self.formatMMSS(resolvedPlan.trackA.mixStartSec)
@@ -1085,7 +1288,7 @@ final class AudioPlayerManager {
         if !isAutomixing {
             let r = resolvedPlan.sync.targetRateA
             let icon = r > 1.003 ? "arrowtriangle.up.fill" : (r < 0.997 ? "arrowtriangle.down.fill" : "waveform")
-            automixBadge = AutomixIndicatorBadge(text: "SINC \(outStr)", icon: icon, kind: .armed)
+            automixBadge = AutomixIndicatorBadge(text: "SYNC \(outStr)", icon: icon, kind: .armed)
         }
 
         logEvent(
@@ -1226,11 +1429,13 @@ final class AudioPlayerManager {
                 if let plan = existingPlan,
                    plan.trackA.id == cur.id,
                    plan.trackB.id == nextSong.id,
-                   let localB = localFileURL(for: nextSong.id),
-                   let fileB = try? AVAudioFile(forReading: localB),
-                   AutomixAudioEngine.canPlay(file: fileB) {
-                    let resolvedPlan = automixEngine.prepareIncoming(fileB: fileB, songId: nextSong.id, plan: plan) ?? plan
-                    activeTransitionPlan = resolvedPlan
+                   let fileB = openEngineFile(for: nextSong.id) {
+                    automixPrepareTask?.cancel()
+                    automixPrepareTask = Task {
+                        let preparedPlan = await automixEngine.prepareIncoming(fileB: fileB, songId: nextSong.id, plan: plan)
+                        guard !Task.isCancelled, currentSong?.id == cur.id else { return }
+                        activeTransitionPlan = preparedPlan ?? plan
+                    }
                 } else {
                     preparedMixHint = nil
                     activeTransitionPlan = nil
@@ -1255,6 +1460,7 @@ final class AudioPlayerManager {
 
     func toggleShuffle() {
         shuffle.toggle()
+        if !shuffle { reorderTask?.cancel() }
         guard !queue.isEmpty, let current = currentSong else { return }
         let priorityEnd = min(currentIndex + 1 + priorityCount, queue.count)
         let prioritySongs = currentIndex + 1 < priorityEnd ? Array(queue[(currentIndex + 1)..<priorityEnd]) : []
@@ -1269,13 +1475,25 @@ final class AudioPlayerManager {
             }
             if automixEnabled, let store = analysisStore {
                 let anchor = prioritySongs.last ?? current
-                let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + remaining, metadata: store.items, startingWith: anchor).dropFirst()
-                queue = [current] + prioritySongs + Array(smartTail)
-                recordSmartShuffleLog(songs: queue, reason: "Ativou Aleatório Inteligente")
-                syncMetadataAndRefreshShuffleIfNeeded(source: playbackSource, originalCount: originalQueue.count)
-            } else {
-                queue = [current] + prioritySongs + remaining.shuffled()
+                let metadata = store.items
+                let token = beginBusy("Montando a fila aleatória")
+                reorderTask?.cancel()
+                reorderTask = Task { [weak self] in
+                    let result = await Task.detached(priority: .userInitiated) {
+                        Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor)
+                    }.value
+                    guard let self else { return }
+                    self.endBusy(token)
+                    guard !Task.isCancelled, self.shuffle, self.currentSong?.id == current.id else { return }
+                    self.queue = [current] + prioritySongs + Array(result.queue.dropFirst())
+                    self.currentIndex = 0
+                    self.publishSmartShuffleLog(result.report, reason: "Ativou Aleatório Inteligente")
+                    self.syncMetadataAndRefreshShuffleIfNeeded(source: self.playbackSource, originalCount: self.originalQueue.count)
+                    self.queueChanged()
+                }
+                return
             }
+            queue = [current] + prioritySongs + remaining.shuffled()
             currentIndex = 0
         } else if !originalQueue.isEmpty {
             var restored = originalQueue
@@ -1289,7 +1507,7 @@ final class AudioPlayerManager {
         queueChanged()
     }
 
-    /// Reorganiza as próximas faixas da fila aleatória com `SmartShuffler`.
+    /// Reorganiza as próximas faixas da fila aleatória com `SmartShuffler` (em segundo plano, sem travar a interface).
     private func reorderUpcomingSmart(reason: String = "Reordenou fila para Automix") {
         guard shuffle, let store = analysisStore, let current = currentSong,
               currentIndex + 1 + priorityCount < queue.count else { return }
@@ -1297,10 +1515,24 @@ final class AudioPlayerManager {
         let keptPrefix = Array(queue[0..<keepEnd])
         let tail = Array(queue[keepEnd..<queue.count])
         let anchor = keptPrefix.last ?? current
-        let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + tail, metadata: store.items, startingWith: anchor).dropFirst()
-        queue = keptPrefix + Array(smartTail)
-        recordSmartShuffleLog(songs: Array(queue[currentIndex..<queue.count]), reason: reason)
-        queueChanged()
+        let metadata = store.items
+        let snapshotCount = queue.count
+        let snapshotIndex = currentIndex
+        let reportFrom = currentIndex
+        reorderTask?.cancel()
+        reorderTask = Task { [weak self] in
+            let result = await Task.detached(priority: .utility) { () -> (queue: [Song], report: SmartShuffleRunLog) in
+                let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + tail, metadata: metadata, startingWith: anchor).dropFirst()
+                let full = keptPrefix + Array(smartTail)
+                return (full, SmartShuffler.buildShuffleReport(orderedSongs: Array(full[reportFrom..<full.count]), metadata: metadata))
+            }.value
+            guard let self, !Task.isCancelled,
+                  self.queue.count == snapshotCount, self.currentIndex == snapshotIndex,
+                  self.currentSong?.id == current.id else { return }
+            self.queue = result.queue
+            self.publishSmartShuffleLog(result.report, reason: reason)
+            self.queueChanged()
+        }
     }
 
     func cycleRepeat() {
@@ -1365,9 +1597,7 @@ final class AudioPlayerManager {
     /// promove a faixa atual para o motor Dual-Deck no tempo exato para tentar mixar a faixa inserida na fila.
     private func promoteToEngineForQueuedMixIfNeeded() {
         guard shouldUseAutomix, !usingEngineMode, let cur = currentSong else { return }
-        if let localURL = localFileURL(for: cur.id),
-           let audioFile = try? AVAudioFile(forReading: localURL),
-           AutomixAudioEngine.canPlay(file: audioFile) {
+        if let audioFile = openEngineFile(for: cur.id) {
             let resumeSec = max(0, currentTime)
             let wasPlaying = isPlaying
             gaplessPlayer.pause()
@@ -1456,10 +1686,18 @@ final class AudioPlayerManager {
             .appendingPathComponent("playback_state.json")
     }
 
-    func saveState() {
+    /// Serial: as gravações nunca se cruzam e o JSON da fila inteira não é codificado na thread principal.
+    nonisolated private static let stateQueue = DispatchQueue(label: "dmusic.playback-state", qos: .utility)
+
+    /// `blocking: true` (ao ir para segundo plano) espera a gravação terminar antes de retornar.
+    func saveState(blocking: Bool = false) {
         guard !queue.isEmpty, queue.count <= 5000 else { return }
         let s = SavedPlayback(songs: queue, index: currentIndex, time: currentTime, source: playbackSource, originalSongs: originalQueue, shuffle: shuffle)
-        if let data = try? JSONEncoder().encode(s) { try? data.write(to: stateURL, options: .atomic) }
+        let url = stateURL
+        let write: @Sendable () -> Void = {
+            if let data = try? JSONEncoder().encode(s) { try? data.write(to: url, options: .atomic) }
+        }
+        if blocking { Self.stateQueue.sync(execute: write) } else { Self.stateQueue.async(execute: write) }
     }
 
     /// Restaura fila, faixa e posição (pausado) ao abrir o app.
@@ -1610,8 +1848,19 @@ final class AudioPlayerManager {
         return nil
     }
 
+    /// Pergunta qual artista abrir quando a faixa/álbum tem vários (painel de menu no estilo do app).
+    func presentArtistPicker(_ entries: [ArtistParser.Entry]) {
+        actionMenu = ActionMenuRequest(
+            title: "Qual artista você quer acessar?",
+            sections: [entries.map { entry in
+                ActionMenuItem(title: entry.name, systemImage: "music.mic") { [weak self] in
+                    self?.navigateToArtistEntry(entry)
+                }
+            }]
+        )
+    }
+
     func navigateToArtistEntry(_ entry: ArtistParser.Entry) {
-        showArtistPicker = false
         let artist = Artist(id: entry.id, name: entry.name, coverArt: entry.coverArt)
         appendToActiveTab(artist, detailId: "artist:\(entry.name.lowercased())")
     }
@@ -1619,8 +1868,7 @@ final class AudioPlayerManager {
     func navigateToSongArtist(_ song: Song) {
         let entries = ArtistParser.artists(for: song)
         if entries.count > 1 {
-            artistChoices = entries
-            showArtistPicker = true
+            presentArtistPicker(entries)
             return
         }
         if let first = entries.first {
@@ -1634,8 +1882,7 @@ final class AudioPlayerManager {
             if let aid = song.albumId, let al = try? await client.album(id: aid) {
                 let albEntries = ArtistParser.artists(for: al)
                 if albEntries.count > 1 {
-                    artistChoices = albEntries
-                    showArtistPicker = true
+                    presentArtistPicker(albEntries)
                 } else if let first = albEntries.first {
                     navigateToArtistEntry(first)
                 }

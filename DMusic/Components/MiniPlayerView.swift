@@ -87,36 +87,3 @@ private struct PlayerBottomSpace: ViewModifier {
         content.contentMargins(.bottom, player.currentSong == nil ? 0 : 80, for: .scrollContent)
     }
 }
-
-extension View {
-    /// Diálogo que pergunta qual artista o usuário deseja abrir quando a faixa/álbum tem múltiplos artistas.
-    func artistPickerDialog(inNowPlaying: Bool) -> some View {
-        modifier(ArtistPickerDialogModifier(inNowPlaying: inNowPlaying))
-    }
-}
-
-private struct ArtistPickerDialogModifier: ViewModifier {
-    let inNowPlaying: Bool
-    @Environment(AudioPlayerManager.self) private var player
-
-    func body(content: Content) -> some View {
-        let isPresented = Binding<Bool>(
-            get: { player.showArtistPicker && (player.showNowPlaying == inNowPlaying) },
-            set: { if !$0 { player.showArtistPicker = false } }
-        )
-        content.confirmationDialog(
-            "Qual artista você quer acessar?",
-            isPresented: isPresented,
-            titleVisibility: .visible
-        ) {
-            ForEach(player.artistChoices) { entry in
-                Button(entry.name) {
-                    player.navigateToArtistEntry(entry)
-                }
-            }
-            Button("Cancelar", role: .cancel) {
-                player.showArtistPicker = false
-            }
-        }
-    }
-}

@@ -3,12 +3,13 @@ import AVKit
 
 struct NowPlayingView: View {
     @Environment(AudioPlayerManager.self) private var player
-    @State private var scrubValue: Double = 0
-    @State private var isDragging = false
     @State private var showQueue = false
     @State private var showAddToPlaylist = false
     @State private var showAutomixStudio = false
+    /// Altura livre entre a base da capa e o título da música (para centralizar o BPM das capas na mixagem).
+    @State private var stageGap: CGFloat = 60
     @State private var dismissDragY: CGFloat = 0
+    @AppStorage("nowplaying_spectrogram_mode") private var showSpectrogram = false
     @Environment(FavoritesStore.self) private var favorites
     @Environment(TrackAnalysisStore.self) private var analysisStore
 
@@ -27,26 +28,37 @@ struct NowPlayingView: View {
 
                 Spacer(minLength: 0)
 
-                DJDualJogStageView(
-                    stageMode: player.djStageMode,
-                    currentCoverArt: player.currentSong?.coverArt,
-                    deckACoverArt: player.djDeckACoverArt,
-                    deckBCoverArt: player.djDeckBCoverArt,
-                    deckARate: player.djDeckARate,
-                    deckABPM: player.djDeckABPM,
-                    deckBBPM: player.djDeckBBPM,
-                    liveBPMTrend: player.liveBPMTrend,
-                    isPlaying: player.isPlaying,
-                    onSettlingFinished: { player.finishDJStageSettling() },
-                    onSwipeNext: { player.next() },
-                    onSwipePrevious: { player.previous() }
-                )
+                if showSpectrogram {
+                    // Borda a borda (ignora o recuo lateral de 20 pt), sem cantos arredondados nem sombra
+                    ScrollingSpectrogramView()
+                        .padding(.horizontal, -20)
+                        .frame(maxWidth: .infinity, minHeight: 280, maxHeight: 440)
+                } else {
+                    DJDualJogStageView(
+                        stageMode: player.djStageMode,
+                        currentCoverArt: player.currentSong?.coverArt,
+                        deckACoverArt: player.djDeckACoverArt,
+                        deckBCoverArt: player.djDeckBCoverArt,
+                        deckARate: player.djDeckARate,
+                        deckABPM: player.liveAnimatedBPM ?? player.djDeckABPM,
+                        deckBBPM: player.djDeckBBPM,
+                        liveBPMTrend: player.liveBPMTrend,
+                        isPlaying: player.isPlaying,
+                        onSettlingFinished: { player.finishDJStageSettling() },
+                        onSwipeNext: { player.next() },
+                        onSwipePrevious: { player.previous() },
+                        chipGap: stageGap
+                    )
+                }
 
                 Spacer(minLength: 0)
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: StageGapKey.self, value: geo.size.height)
+                    })
 
                 trackHeader
 
-                scrubberSection
+                NowPlayingScrubberView(onOpenAutomixStudio: { showAutomixStudio = true })
 
                 transportControls
 
@@ -56,18 +68,16 @@ struct NowPlayingView: View {
             .padding(.bottom, 12)
         }
         .preferredColorScheme(.dark)
-        .artistPickerDialog(inNowPlaying: true)
         .sheet(isPresented: $showQueue) { QueueView() }
         .sheet(isPresented: $showAddToPlaylist) {
             if let s = player.currentSong { AddToPlaylistSheet(songs: [s]) }
         }
+        .onPreferenceChange(StageGapKey.self) { stageGap = $0 }
         .sheet(isPresented: $showAutomixStudio) {
             AutomixStudioSheet()
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
-        .onAppear { scrubValue = player.currentTime }
-        .onChange(of: player.currentTime) { _, t in if !isDragging { scrubValue = t } }
         .offset(y: dismissDragY)
         .gesture(
             DragGesture(minimumDistance: 14)
@@ -97,25 +107,7 @@ struct NowPlayingView: View {
     // MARK: - Subviews
 
     private var ambientBackground: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let cover = player.currentSong?.coverArt {
-                GeometryReader { geo in
-                    CoverArtView(coverArt: cover, size: 300, cornerRadius: 0)
-                        .frame(width: geo.size.width * 1.4, height: geo.size.height * 1.2)
-                        .blur(radius: 75)
-                        .opacity(0.42)
-                        .position(x: geo.size.width / 2, y: geo.size.height * 0.35)
-                }
-                .ignoresSafeArea()
-            }
-            LinearGradient(
-                colors: [Color.black.opacity(0.25), Color.black.opacity(0.65), Color.black.opacity(0.92)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea()
-        }
+        AmbientCoverBackground(coverArt: player.currentSong?.coverArt)
     }
 
     private var topBar: some View {
@@ -164,50 +156,25 @@ struct NowPlayingView: View {
 
             Spacer(minLength: 4)
 
-            Menu {
-                if let song = player.currentSong {
-                    let entries = ArtistParser.artists(for: song)
-                    if entries.count > 1 {
-                        Menu {
-                            ForEach(entries) { entry in
-                                Button(entry.name) { player.navigateToArtistEntry(entry) }
-                            }
-                        } label: {
-                            Label("Ir para o Artista", systemImage: "music.mic")
-                        }
-                    } else {
-                        Button { player.navigateToSongArtist(song) } label: {
-                            Label("Ir para o Artista", systemImage: "music.mic")
-                        }
-                    }
-                    Button { player.navigateToSongAlbum(song) } label: {
-                        Label("Ir para o Álbum", systemImage: "square.stack")
-                    }
+            Button {
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    showSpectrogram.toggle()
                 }
-                if let source = player.effectivePlaybackSource {
-                    Button { player.navigateToSource() } label: {
-                        Label("Ir para \(source.title)", systemImage: "arrow.turn.up.right")
-                    }
-                }
-                if player.currentSong != nil {
-                    Button { showAddToPlaylist = true } label: {
-                        Label("Adicionar à playlist", systemImage: "music.note.list")
-                    }
-                }
-                Button { showAutomixStudio = true } label: {
-                    Label("Estúdio de Mixagem (EQ / Filtros)", systemImage: "slider.horizontal.3")
-                }
-                Menu {
-                    ForEach([15, 30, 45, 60], id: \.self) { m in
-                        Button("\(m) minutos") { player.setSleepTimer(minutes: m) }
-                    }
-                    Button("Ao fim da faixa") { player.sleepAfterCurrentTrack() }
-                    if player.sleepEnd != nil || player.sleepAtEndOfTrack {
-                        Button("Desativar", role: .destructive) { player.cancelSleep() }
-                    }
-                } label: {
-                    Label("Dormir (\(sleepLabel))", systemImage: "moon.zzz.fill")
-                }
+            } label: {
+                Image(systemName: showSpectrogram ? "photo.fill" : "waveform")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(showSpectrogram ? Color(red: 0.25, green: 0.78, blue: 1.0) : .white)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        (showSpectrogram ? Color(red: 0.25, green: 0.78, blue: 1.0).opacity(0.20) : Color.white.opacity(0.1)),
+                        in: Circle()
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showSpectrogram ? "Mostrar capa" : "Mostrar espectrograma Rekordbox")
+
+            Button {
+                presentPlayerMenu()
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.subheadline.weight(.bold))
@@ -215,7 +182,65 @@ struct NowPlayingView: View {
                     .background(Color.white.opacity(0.1), in: Circle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Mais opções")
         }
+    }
+
+    /// Menu "…" do player no painel padrão do app (navegação, playlist, estúdio e timer de sono).
+    private func presentPlayerMenu() {
+        let player = self.player
+        var go: [ActionMenuItem] = []
+        if let song = player.currentSong {
+            let entries = ArtistParser.artists(for: song)
+            if entries.count > 1 {
+                go.append(ActionMenuItem(
+                    title: "Ir para o artista",
+                    systemImage: "music.mic",
+                    children: entries.map { entry in
+                        ActionMenuItem(title: entry.name, systemImage: "person.fill") { player.navigateToArtistEntry(entry) }
+                    }
+                ))
+            } else {
+                go.append(ActionMenuItem(title: "Ir para o artista", systemImage: "music.mic") { player.navigateToSongArtist(song) })
+            }
+            go.append(ActionMenuItem(title: "Ir para o álbum", systemImage: "square.stack") { player.navigateToSongAlbum(song) })
+        }
+        if let source = player.effectivePlaybackSource {
+            go.append(ActionMenuItem(title: "Ir para \(source.title)", systemImage: "arrow.turn.up.right") { player.navigateToSource() })
+        }
+
+        var tools: [ActionMenuItem] = []
+        if let song = player.currentSong {
+            tools.append(ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: [song]) })
+        }
+        tools.append(ActionMenuItem(title: "Estúdio de mixagem", subtitle: "EQ, filtros e curvas do Automix", systemImage: "slider.horizontal.3", style: .accent) {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(380))
+                showAutomixStudio = true
+            }
+        })
+
+        let sleepActive = player.sleepEnd != nil || player.sleepAtEndOfTrack
+        let sleepOptions: [Int] = [15, 30, 45, 60]
+        var sleepItems: [ActionMenuItem] = sleepOptions.map { minutes in
+            ActionMenuItem(title: "\(minutes) minutos", systemImage: "moon.zzz") { player.setSleepTimer(minutes: minutes) }
+        }
+        sleepItems.append(ActionMenuItem(title: "Ao fim da faixa", systemImage: "music.note") { player.sleepAfterCurrentTrack() })
+        if sleepActive {
+            sleepItems.append(ActionMenuItem(title: "Desativar", systemImage: "xmark.circle", style: .destructive) { player.cancelSleep() })
+        }
+        let sleep = [ActionMenuItem(
+            title: "Dormir",
+            subtitle: sleepActive ? sleepLabel : nil,
+            systemImage: "moon.zzz.fill",
+            children: sleepItems
+        )]
+
+        var header: ActionMenuHeader?
+        if let song = player.currentSong {
+            header = ActionMenuHeader(title: song.title, subtitle: ArtistParser.displayString(for: song), coverArt: song.coverArt)
+        }
+        player.actionMenu = ActionMenuRequest(header: header, sections: [go, tools, sleep].filter { !$0.isEmpty })
     }
 
     private var trackHeader: some View {
@@ -250,11 +275,13 @@ struct NowPlayingView: View {
 
                         Spacer(minLength: 4)
 
-                        if analysisStore.metadata(for: song.id) != nil || player.liveAnimatedBPM != nil {
+                        if let meta = analysisStore.metadata(for: song.id) {
+                            // O BPM ao lado do nome da faixa é SEMPRE o BPM fixo original da faixa;
+                            // o único BPM que altera ao vivo na mudança de ritmo aparece nos Decks / Espectrograma.
                             LiveBPMBadgeView(
-                                staticMix: analysisStore.metadata(for: song.id),
-                                liveBPM: player.liveAnimatedBPM,
-                                trend: player.liveBPMTrend
+                                staticMix: meta,
+                                liveBPM: nil,
+                                trend: 0
                             )
                             .layoutPriority(1)
                         }
@@ -273,59 +300,6 @@ struct NowPlayingView: View {
                 }
                 .buttonStyle(.plain)
             }
-        }
-    }
-
-    private var scrubberSection: some View {
-        let maxTime = max(player.effectiveScrubberEndTime, 1.0)
-        let activeTime = min(isDragging ? scrubValue : player.currentTime, maxTime)
-        return VStack(spacing: 4) {
-            DJScrubberSlider(
-                value: $scrubValue,
-                maxTime: maxTime,
-                currentTime: player.currentTime,
-                isDragging: $isDragging,
-                plan: player.shouldUseAutomix ? player.activeTransitionPlan : nil,
-                onEditingChanged: { editing in
-                    player.scrubbing(editing)
-                    if !editing {
-                        player.seek(to: min(scrubValue, maxTime))
-                    }
-                }
-            )
-
-            HStack(alignment: .center) {
-                Text(formatTime(activeTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 46, alignment: .leading)
-
-                Spacer()
-
-                if let song = player.currentSong {
-                    HStack(spacing: 5) {
-                        if player.shouldUseAutomix, let badge = player.automixBadge {
-                            Button { showAutomixStudio = true } label: {
-                                AutomixPillBadgeView(badge: badge)
-                            }
-                            .buttonStyle(.plain)
-                        } else if song.isHiRes {
-                            QualityBadge(text: "HI-RES", highlighted: true)
-                        }
-                        if let q = song.qualityText {
-                            QualityBadge(text: q)
-                        }
-                    }
-                }
-
-                Spacer()
-
-                Text("-" + formatTime(max(maxTime - activeTime, 0)))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 46, alignment: .trailing)
-            }
-            .frame(height: 22)
         }
     }
 
@@ -382,7 +356,11 @@ struct NowPlayingView: View {
         HStack(spacing: 12) {
             AirPlayRouteButton().styled()
 
-            Spacer()
+            Spacer(minLength: 8)
+
+            fileInfo
+
+            Spacer(minLength: 8)
 
             Button { showQueue = true } label: {
                 ZStack(alignment: .topTrailing) {
@@ -406,6 +384,49 @@ struct NowPlayingView: View {
         .padding(.horizontal, 4)
     }
 
+    /// Tipo do arquivo e qualidade da faixa que está tocando: `FLAC  24-bit / 96 kHz` e, embaixo, `HI-RES` em texto simples.
+    @ViewBuilder
+    private var fileInfo: some View {
+        if let song = player.currentSong, let suffix = song.suffix, !suffix.isEmpty {
+            VStack(spacing: 3) {
+                HStack(spacing: 6) {
+                    QualityBadge(text: suffix.uppercased())
+                    if let detail = Self.qualityDetail(for: song) {
+                        Text(detail)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.55))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                }
+                if song.isHiRes {
+                    Text("HI-RES")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.2)
+                        .foregroundStyle(Color(red: 0.90, green: 0.78, blue: 0.42))
+                }
+            }
+            .multilineTextAlignment(.center)
+            .id(song.id)
+            .transition(.opacity)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Arquivo \(suffix.uppercased())"
+                + (Self.qualityDetail(for: song).map { ", \($0)" } ?? "")
+                + (song.isHiRes ? ", alta resolução" : ""))
+        }
+    }
+
+    private static func qualityDetail(for song: Song) -> String? {
+        if let depth = song.bitDepth, depth > 0, let rate = song.samplingRate, rate > 0 {
+            let khz = Double(rate) / 1000
+            let khzText = khz.truncatingRemainder(dividingBy: 1) == 0 ? "\(Int(khz))" : String(format: "%.1f", khz)
+            return "\(depth)-bit / \(khzText) kHz"
+        }
+        if let kbps = song.bitRate, kbps > 0 { return "\(kbps) kbps" }
+        return nil
+    }
+
     private func titleWithAlbum(for song: Song) -> String {
         if let album = song.album, !album.isEmpty {
             return "\(song.title) - \(album)"
@@ -423,521 +444,8 @@ struct NowPlayingView: View {
     }
 }
 
-/// Palco 1:1 fixo e sem moldura com câmera virtual de mesa DJ:
-/// - `.idle`: capa pura encaixada sem fundo/moldura (`fitInsideSquare: true`)
-/// - `.ramping`: começa junto com a mudança de BPM; câmera afasta mostrando Deck A virando Jog e Deck B entrando pela direita já girando (Cue) no mesmo tamanho
-/// - `.mixing`: Decks A e B giram lado a lado em tamanho idêntico e sincronia total (Deck A nunca encolhe)
-/// - `.settling`: câmera dá zoom-in direto no Deck B empurrando Deck A girando pela lateral esquerda; Deck B freia no sentido horário até 0° cravado e desmascara virando capa.
-private struct DJDualJogStageView: View {
-    let stageMode: DJStageMode
-    let currentCoverArt: String?
-    let deckACoverArt: String?
-    let deckBCoverArt: String?
-    let deckARate: Float
-    let deckABPM: Double?
-    let deckBBPM: Double?
-    let liveBPMTrend: Int
-    let isPlaying: Bool
-    let onSettlingFinished: () -> Void
-    let onSwipeNext: () -> Void
-    let onSwipePrevious: () -> Void
-
-    private static let worldHalfGap: CGFloat = 0.62
-    private static let worldXA: CGFloat = -worldHalfGap
-    private static let worldXB: CGFloat = worldHalfGap
-    private static let dualZoom: CGFloat = 0.44
-    private static let wideCamDist: CGFloat = 1.0 / dualZoom
-    private static let cruiseSpeed: Double = 200.0
-    private static let brakeDuration: Double = 0.80
-    private static let brakeDistance: Double = 80.0
-    private static let unmaskDuration: Double = 0.44
-
-    @State private var phaseStartDate = Date()
-    @State private var anchorDate = Date()
-    @State private var pausedAt: Date? = nil
-    @State private var anchorAngleA: Double = 0.0
-    @State private var anchorAngleB: Double = 0.0
-    @State private var enteredFromRamping: Bool = false
-    @State private var mixStartCameraT: Double = 0.0
-
-    @State private var settleStartAngleA: Double = 0.0
-    @State private var settleStartAngleB: Double = 0.0
-    @State private var settleStartCamT: Double = 1.0
-    @State private var settleRemB: Double = 360.0
-    @State private var settleAlignDuration: Double = 1.6
-    @State private var settleTask: Task<Void, Never>? = nil
-    @State private var coverDragX: CGFloat = 0
-
-    var body: some View {
-        Color.clear
-            .aspectRatio(1, contentMode: .fit)
-            .overlay {
-                GeometryReader { geo in
-                    let side = min(geo.size.width, geo.size.height)
-                    TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !(stageMode != .idle && isPlaying))) { timeline in
-                        let evalDate = isPlaying ? timeline.date : (pausedAt ?? timeline.date)
-                        stageContent(side: side, at: evalDate)
-                            .frame(width: geo.size.width, height: geo.size.height)
-                    }
-                }
-            }
-            .onAppear {
-                let now = Date()
-                pausedAt = isPlaying ? nil : now
-                anchorDate = now
-                phaseStartDate = now
-                anchorAngleA = 0
-                anchorAngleB = 0
-                if stageMode == .settling {
-                    scheduleSettleFinish(remainingDelay: settleAlignDuration + Self.unmaskDuration + 0.04)
-                }
-            }
-            .onChange(of: stageMode) { oldMode, newMode in
-                let now = Date()
-                let evalNow = isPlaying ? now : (pausedAt ?? now)
-                settleTask?.cancel()
-                settleTask = nil
-
-                switch newMode {
-                case .idle:
-                    phaseStartDate = now
-                    anchorDate = now
-                    pausedAt = nil
-                    anchorAngleA = 0
-                    anchorAngleB = 0
-                    enteredFromRamping = false
-                    mixStartCameraT = 0.0
-
-                case .ramping:
-                    phaseStartDate = now
-                    anchorDate = now
-                    pausedAt = isPlaying ? nil : now
-                    anchorAngleA = 0
-                    anchorAngleB = 0
-                    enteredFromRamping = false
-                    mixStartCameraT = 0.0
-
-                case .mixing:
-                    if oldMode == .ramping {
-                        let dt = max(0, evalNow.timeIntervalSince(phaseStartDate))
-                        let speedA = Self.cruiseSpeed * Double(max(deckARate, 0.5))
-                        anchorAngleA = anchorAngleA + Self.spinDelta(dt: dt, speed: speedA, rampUp: 0.45)
-                        anchorAngleB = anchorAngleB + Self.cruiseSpeed * dt
-                        mixStartCameraT = min(max(dt - 0.12, 0.0) / 0.74, 1.0)
-                        enteredFromRamping = true
-                    } else {
-                        anchorAngleA = 0
-                        anchorAngleB = 0
-                        mixStartCameraT = 0.0
-                        enteredFromRamping = false
-                    }
-                    phaseStartDate = now
-                    anchorDate = now
-                    pausedAt = isPlaying ? nil : now
-
-                case .settling:
-                    let dt = max(0, evalNow.timeIntervalSince(anchorDate))
-                    let dtPhase = max(0, evalNow.timeIntervalSince(phaseStartDate))
-                    let speedA = Self.cruiseSpeed * Double(max(deckARate, 0.5))
-
-                    if oldMode == .mixing {
-                        settleStartCamT = min(mixStartCameraT + dtPhase / 0.55, 1.0)
-                        settleStartAngleA = anchorAngleA + (enteredFromRamping ? speedA * dt : Self.spinDelta(dt: dt, speed: speedA, rampUp: 0.25))
-                        settleStartAngleB = anchorAngleB + Self.cruiseSpeed * dt
-                    } else {
-                        settleStartCamT = 1.0
-                        settleStartAngleA = anchorAngleA
-                        settleStartAngleB = anchorAngleB
-                    }
-
-                    var norm = settleStartAngleB.truncatingRemainder(dividingBy: 360.0)
-                    if norm < 0 { norm += 360.0 }
-                    let rawRem = norm < 0.01 ? 360.0 : (360.0 - norm)
-                    let rem = rawRem < Self.brakeDistance ? (rawRem + 360.0) : rawRem
-                    settleRemB = rem
-                    settleAlignDuration = (rem - Self.brakeDistance) / Self.cruiseSpeed + Self.brakeDuration
-
-                    phaseStartDate = now
-                    anchorDate = now
-                    pausedAt = isPlaying ? nil : now
-
-                    if isPlaying {
-                        scheduleSettleFinish(remainingDelay: settleAlignDuration + Self.unmaskDuration + 0.04)
-                    }
-                }
-            }
-            .onChange(of: isPlaying) { wasPlaying, nowPlaying in
-                let now = Date()
-                if wasPlaying && !nowPlaying {
-                    pausedAt = now
-                    if stageMode == .settling {
-                        settleTask?.cancel()
-                        settleTask = nil
-                    }
-                } else if !wasPlaying && nowPlaying {
-                    if let pDate = pausedAt {
-                        let pauseDelta = now.timeIntervalSince(pDate)
-                        phaseStartDate = phaseStartDate.addingTimeInterval(pauseDelta)
-                        anchorDate = anchorDate.addingTimeInterval(pauseDelta)
-                        pausedAt = nil
-                    }
-                    if stageMode == .settling {
-                        let elapsed = max(0, now.timeIntervalSince(phaseStartDate))
-                        let total = settleAlignDuration + Self.unmaskDuration + 0.04
-                        scheduleSettleFinish(remainingDelay: max(0.05, total - elapsed))
-                    }
-                }
-            }
-            .onDisappear {
-                settleTask?.cancel()
-                settleTask = nil
-            }
-    }
-
-    private func scheduleSettleFinish(remainingDelay: Double) {
-        settleTask?.cancel()
-        settleTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(remainingDelay))
-            guard !Task.isCancelled else { return }
-            onSettlingFinished()
-        }
-    }
-
-    // MARK: - Funções Puras de Cinemática & Câmera Virtual
-
-    private static func easeInOut(_ x: Double) -> Double {
-        let t = min(max(x, 0.0), 1.0)
-        return t < 0.5 ? (4.0 * t * t * t) : (1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0)
-    }
-
-    private static func spinDelta(dt: Double, speed: Double, rampUp: Double) -> Double {
-        guard dt > 0 else { return 0 }
-        let r = max(rampUp, 0.01)
-        if dt <= r {
-            return 0.5 * (speed / r) * dt * dt
-        }
-        return 0.5 * speed * r + speed * (dt - r)
-    }
-
-    private static func settlingAngleB(dt: Double, startAngle: Double, rem: Double, alignDuration: Double) -> Double {
-        if dt <= 0 { return startAngle }
-        if dt >= alignDuration { return startAngle + rem }
-        if rem >= brakeDistance {
-            let tCruise = (rem - brakeDistance) / cruiseSpeed
-            if dt <= tCruise {
-                return startAngle + cruiseSpeed * dt
-            }
-            let u = min(max((dt - tCruise) / brakeDuration, 0.0), 1.0)
-            return startAngle + (rem - brakeDistance) + brakeDistance * (2.0 * u - u * u)
-        } else {
-            let u = min(max(dt / max(alignDuration, 0.01), 0.0), 1.0)
-            return startAngle + rem * (2.0 * u - u * u)
-        }
-    }
-
-    /// Mantém o prato 100% visível enquanto estiver dentro ou cruzando a borda da tela;
-    /// só atenua quando já saiu completamente pela lateral da câmera.
-    private static func edgeVisibility(offsetX: CGFloat, scale: CGFloat, side: CGFloat) -> Double {
-        guard side > 1 else { return 1.0 }
-        let halfDisk = 0.5 * scale * side
-        let nearestEdge = max(0.0, abs(offsetX) - halfDisk) / side
-        let fadeStart: CGFloat = 0.62
-        let fadeEnd: CGFloat = 0.74
-        if nearestEdge <= fadeStart { return 1.0 }
-        if nearestEdge >= fadeEnd { return 0.0 }
-        let t = (nearestEdge - fadeStart) / (fadeEnd - fadeStart)
-        return Double(1.0 - easeInOut(Double(t)))
-    }
-
-    private static func syncRingColor(rate: Float) -> Color {
-        if rate > 1.003 {
-            return Color(red: 0.72, green: 0.36, blue: 1.0)   // Roxo/Violeta (aumentando BPM)
-        } else if rate < 0.997 {
-            return Color(red: 1.0, green: 0.34, blue: 0.38)   // Coral/Vermelho (reduzindo BPM)
-        }
-        return Color(red: 0.12, green: 0.88, blue: 0.42)      // Verde (reproduzindo normal)
-    }
-
-    // MARK: - Renderização por Fase
-
-    @ViewBuilder
-    private func stageContent(side: CGFloat, at evalDate: Date) -> some View {
-        let dtPhase = max(0, evalDate.timeIntervalSince(phaseStartDate))
-        let dtAnchor = max(0, evalDate.timeIntervalSince(anchorDate))
-        let greenLED = Color(red: 0.12, green: 0.88, blue: 0.42)
-        let amberLED = Color(red: 1.0, green: 0.62, blue: 0.12)
-        let neutralLED = Color.white.opacity(0.68)
-
-        switch stageMode {
-        case .idle:
-            MorphingCoverDiscView(
-                coverArt: currentCoverArt,
-                side: side,
-                scale: isPlaying ? 1.0 : 0.92,
-                circleMorph: 0.0,
-                spinAngle: 0.0,
-                jogChromeOpacity: 0.0,
-                ringColor: neutralLED
-            )
-            .offset(x: coverDragX)
-            .animation(.spring(duration: 0.38), value: isPlaying)
-            .gesture(
-                DragGesture(minimumDistance: 18)
-                    .onChanged { v in
-                        if abs(v.translation.width) > abs(v.translation.height) {
-                            coverDragX = v.translation.width * 0.75
-                        }
-                    }
-                    .onEnded { v in
-                        let dx = v.translation.width
-                        if dx < -65 {
-                            withAnimation(.easeOut(duration: 0.18)) { coverDragX = -side * 0.6 }
-                            onSwipeNext()
-                            withAnimation(.spring(duration: 0.32)) { coverDragX = 0 }
-                        } else if dx > 65 {
-                            withAnimation(.easeOut(duration: 0.18)) { coverDragX = side * 0.6 }
-                            onSwipePrevious()
-                            withAnimation(.spring(duration: 0.32)) { coverDragX = 0 }
-                        } else {
-                            withAnimation(.spring(duration: 0.32)) { coverDragX = 0 }
-                        }
-                    }
-            )
-
-        case .ramping:
-            let morphA = CGFloat(Self.easeInOut(min(dtPhase / 0.38, 1.0)))
-            let camT = min(max(dtPhase - 0.12, 0.0) / 0.74, 1.0)
-            let zoomEase = CGFloat(Self.easeInOut(camT))
-            let camDist = 1.0 + (Self.wideCamDist - 1.0) * zoomEase
-            let camZoom = 1.0 / camDist
-            let camCenterX = Self.worldXA * (1.0 - zoomEase)
-
-            let offsetXA = (Self.worldXA - camCenterX) * camZoom * side
-            let offsetXB = (Self.worldXB - camCenterX) * camZoom * side
-
-            let speedA = Self.cruiseSpeed * Double(max(deckARate, 0.5))
-            let angleA = anchorAngleA + Self.spinDelta(dt: dtPhase, speed: speedA, rampUp: 0.45)
-            // Segunda faixa já entra girando em pré-escuta (cue fantasma)
-            let angleB = anchorAngleB + Self.cruiseSpeed * dtPhase
-
-            let visB = Self.edgeVisibility(offsetX: offsetXB, scale: camZoom, side: side)
-            let readoutAlpha = Self.easeInOut(min(max((camT - 0.35) / 0.65, 0.0), 1.0))
-            let chipY = 0.5 * camZoom * side + 20.0
-            let syncColor: Color = (liveBPMTrend == 0 && abs(deckARate - 1.0) >= 0.003)
-                ? greenLED
-                : Self.syncRingColor(rate: deckARate)
-
-            ZStack {
-                if visB > 0.01 {
-                    MorphingCoverDiscView(
-                        coverArt: deckBCoverArt,
-                        side: side,
-                        scale: camZoom,
-                        circleMorph: 1.0,
-                        spinAngle: angleB,
-                        jogChromeOpacity: 1.0,
-                        ringColor: amberLED
-                    )
-                    .offset(x: offsetXB)
-                    .opacity(visB)
-                }
-
-                MorphingCoverDiscView(
-                    coverArt: deckACoverArt ?? currentCoverArt,
-                    side: side,
-                    scale: camZoom,
-                    circleMorph: morphA,
-                    spinAngle: angleA,
-                    jogChromeOpacity: Double(morphA),
-                    ringColor: greenLED
-                )
-                .offset(x: offsetXA)
-
-                if readoutAlpha > 0.01 {
-                    let isChangingBPM = (liveBPMTrend != 0)
-                    let blink = isChangingBPM ? (0.45 + 0.55 * (0.5 + 0.5 * sin(dtPhase * 7.0))) : 1.0
-                    if let bpmA = deckABPM, bpmA > 0 {
-                        DJDeckBPMChip(
-                            bpm: bpmA,
-                            trend: liveBPMTrend,
-                            accent: isChangingBPM ? syncColor : greenLED,
-                            blinkOpacity: blink
-                        )
-                        .offset(x: offsetXA, y: chipY)
-                        .opacity(readoutAlpha)
-                    }
-                    if let bpmB = deckBBPM, bpmB > 0, visB > 0.05 {
-                        DJDeckBPMChip(
-                            bpm: bpmB,
-                            trend: 0,
-                            accent: amberLED,
-                            blinkOpacity: 1.0
-                        )
-                        .offset(x: offsetXB, y: chipY)
-                        .opacity(readoutAlpha * visB)
-                    }
-                }
-            }
-
-        case .mixing:
-            let camT = min(mixStartCameraT + dtPhase / 0.55, 1.0)
-            let zoomEase = CGFloat(Self.easeInOut(camT))
-            let camDist = 1.0 + (Self.wideCamDist - 1.0) * zoomEase
-            let camZoom = 1.0 / camDist
-            let camCenterX = Self.worldXA * (1.0 - zoomEase)
-
-            let offsetXA = (Self.worldXA - camCenterX) * camZoom * side
-            let offsetXB = (Self.worldXB - camCenterX) * camZoom * side
-
-            let morphA: CGFloat = enteredFromRamping ? 1.0 : CGFloat(Self.easeInOut(min(dtPhase / 0.32, 1.0)))
-            let speedA = Self.cruiseSpeed * Double(max(deckARate, 0.5))
-            let angleA = anchorAngleA + (enteredFromRamping ? speedA * dtAnchor : Self.spinDelta(dt: dtAnchor, speed: speedA, rampUp: 0.25))
-            let angleB = anchorAngleB + Self.cruiseSpeed * dtAnchor
-
-            let visB = Self.edgeVisibility(offsetX: offsetXB, scale: camZoom, side: side)
-            let readoutAlpha = enteredFromRamping ? 1.0 : Self.easeInOut(min(max((camT - 0.35) / 0.65, 0.0), 1.0))
-            let chipY = 0.5 * camZoom * side + 20.0
-
-            ZStack {
-                MorphingCoverDiscView(
-                    coverArt: deckACoverArt,
-                    side: side,
-                    scale: camZoom,
-                    circleMorph: morphA,
-                    spinAngle: angleA,
-                    jogChromeOpacity: Double(morphA),
-                    ringColor: greenLED
-                )
-                .offset(x: offsetXA)
-
-                if visB > 0.01 {
-                    MorphingCoverDiscView(
-                        coverArt: deckBCoverArt ?? currentCoverArt,
-                        side: side,
-                        scale: camZoom,
-                        circleMorph: 1.0,
-                        spinAngle: angleB,
-                        jogChromeOpacity: 1.0,
-                        ringColor: greenLED
-                    )
-                    .offset(x: offsetXB)
-                    .opacity(visB)
-                }
-
-                if readoutAlpha > 0.01 {
-                    if let bpmA = deckABPM, bpmA > 0 {
-                        DJDeckBPMChip(
-                            bpm: bpmA,
-                            trend: 0,
-                            accent: greenLED
-                        )
-                        .offset(x: offsetXA, y: chipY)
-                        .opacity(readoutAlpha)
-                    }
-                    if let bpmB = deckBBPM, bpmB > 0, visB > 0.05 {
-                        DJDeckBPMChip(
-                            bpm: bpmB,
-                            trend: 0,
-                            accent: greenLED
-                        )
-                        .offset(x: offsetXB, y: chipY)
-                        .opacity(readoutAlpha * visB)
-                    }
-                }
-            }
-
-        case .settling:
-            let alignU = CGFloat(Self.easeInOut(min(dtPhase / max(settleAlignDuration, 0.01), 1.0)))
-            let startEase = CGFloat(Self.easeInOut(settleStartCamT))
-            let startDist = 1.0 + (Self.wideCamDist - 1.0) * startEase
-            let startCamX = Self.worldXA * (1.0 - startEase)
-
-            // A câmera foca e faz zoom-in no Deck B, empurrando naturalmente o Deck A pela lateral esquerda
-            let camDist = startDist + (1.0 - startDist) * alignU
-            let camZoom = 1.0 / camDist
-            let camCenterX = startCamX + (Self.worldXB - startCamX) * alignU
-
-            let speedA = Self.cruiseSpeed * Double(max(deckARate, 0.5))
-            let angleA = settleStartAngleA + speedA * dtPhase
-            let offsetXA = (Self.worldXA - camCenterX) * camZoom * side
-            let visA = dtPhase >= settleAlignDuration ? 0.0 : Self.edgeVisibility(offsetX: offsetXA, scale: camZoom, side: side)
-
-            // Sub-fase 4A (0 .. settleAlignDuration): câmera zoom-in até Deck B 100% centrado, freia até 0° cravado
-            // Sub-fase 4B (settleAlignDuration .. settleAlignDuration + unmaskDuration): já parada a 0° no centro, vira capa!
-            let angleB = Self.settlingAngleB(
-                dt: dtPhase,
-                startAngle: settleStartAngleB,
-                rem: settleRemB,
-                alignDuration: settleAlignDuration
-            )
-            let offsetXB = (Self.worldXB - camCenterX) * camZoom * side
-
-            let chromeFadeStart: CGFloat = 0.55
-            let chromeFadeEnd: CGFloat = 0.96
-            let chromeT = min(max((alignU - chromeFadeStart) / (chromeFadeEnd - chromeFadeStart), 0.0), 1.0)
-            let chromeOpacityB = dtPhase >= settleAlignDuration ? 0.0 : Double(1.0 - chromeT)
-
-            let unmaskProgress: CGFloat = dtPhase <= settleAlignDuration
-                ? 0.0
-                : CGFloat(Self.easeInOut(min((dtPhase - settleAlignDuration) / Self.unmaskDuration, 1.0)))
-            let morphB: CGFloat = 1.0 - unmaskProgress
-
-            let chipFade = max(0.0, 1.0 - Self.easeInOut(min(dtPhase / 0.32, 1.0)))
-            let chipY = 0.5 * camZoom * side + 20.0
-
-            ZStack {
-                if visA > 0.01, let outCover = deckACoverArt {
-                    MorphingCoverDiscView(
-                        coverArt: outCover,
-                        side: side,
-                        scale: camZoom,
-                        circleMorph: 1.0,
-                        spinAngle: angleA,
-                        jogChromeOpacity: 1.0,
-                        ringColor: neutralLED
-                    )
-                    .offset(x: offsetXA)
-                    .opacity(visA)
-                }
-
-                MorphingCoverDiscView(
-                    coverArt: deckBCoverArt ?? currentCoverArt,
-                    side: side,
-                    scale: camZoom,
-                    circleMorph: morphB,
-                    spinAngle: angleB,
-                    jogChromeOpacity: chromeOpacityB,
-                    ringColor: greenLED
-                )
-                .offset(x: offsetXB)
-
-                if chipFade > 0.01 {
-                    if let bpmA = deckABPM, bpmA > 0, visA > 0.01 {
-                        DJDeckBPMChip(
-                            bpm: bpmA,
-                            trend: 0,
-                            accent: neutralLED
-                        )
-                        .offset(x: offsetXA, y: chipY)
-                        .opacity(chipFade * visA)
-                    }
-                    if let bpmB = deckBBPM, bpmB > 0 {
-                        DJDeckBPMChip(
-                            bpm: bpmB,
-                            trend: 0,
-                            accent: greenLED
-                        )
-                        .offset(x: offsetXB, y: chipY)
-                        .opacity(chipFade)
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Pílula compacta com BPM animado em tempo real exibida sob os pratos durante a transição (sem rótulos de Deck/Cue).
-private struct DJDeckBPMChip: View {
+struct DJDeckBPMChip: View {
     let bpm: Double
     let trend: Int
     let accent: Color
@@ -1012,132 +520,6 @@ private struct LiveBPMBadgeView: View {
 
             if let camelot = staticMix?.camelot, !camelot.isEmpty {
                 CamelotBadge(camelot: camelot)
-            }
-        }
-    }
-}
-
-/// Arte da capa sem moldura que interpola perfeitamente de:
-/// - `circleMorph == 0.0`: capa completa sem recorte (`fitW × fitH`, `cornerRadius: 16 * scale`)
-/// - `circleMorph == 1.0`: disco circular perfeito preenchendo `targetSide × targetSide`,
-/// mantendo os anéis de Jog Wheel nítidos na escala final sem double-scaling.
-private struct MorphingCoverDiscView: View {
-    let coverArt: String?
-    let side: CGFloat
-    let scale: CGFloat
-    let circleMorph: CGFloat
-    let spinAngle: Double
-    let jogChromeOpacity: Double
-    let ringColor: Color
-
-    @Environment(AuthViewModel.self) private var auth
-    @State private var loadedImage: UIImage?
-
-    private func fittedDimensions(for image: UIImage?, targetSide: CGFloat) -> (CGFloat, CGFloat) {
-        guard let img = image, img.size.width > 0, img.size.height > 0 else {
-            return (targetSide, targetSide)
-        }
-        let aspect = img.size.width / img.size.height
-        return aspect >= 1.0
-            ? (targetSide, targetSide / aspect)
-            : (targetSide * aspect, targetSide)
-    }
-
-    var body: some View {
-        let targetSide = max(side * scale, 1)
-        let m = min(max(circleMorph, 0.0), 1.0)
-        let resolvedImage = loadedImage ?? coverArt.flatMap { ImageCache.shared.cachedImage(id: $0, size: 600) }
-        let (fitW, fitH) = fittedDimensions(for: resolvedImage, targetSide: targetSide)
-
-        let boxW = fitW + (targetSide - fitW) * m
-        let boxH = fitH + (targetSide - fitH) * m
-        let baseCorner = 16.0 * scale
-        let cr = baseCorner + (min(boxW, boxH) * 0.5 - baseCorner) * m
-
-        ZStack {
-            Group {
-                if let resolvedImage {
-                    Image(uiImage: resolvedImage)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    LinearGradient(
-                        colors: [Color(white: 0.22), Color(white: 0.12)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .overlay(
-                        Image(systemName: "music.note")
-                            .font(.system(size: max(18, 28 * scale), weight: .light))
-                            .foregroundStyle(.white.opacity(0.35))
-                    )
-                }
-            }
-            .frame(width: boxW, height: boxH)
-            .clipShape(RoundedRectangle(cornerRadius: cr, style: .continuous))
-            .rotationEffect(.degrees(spinAngle))
-
-            if jogChromeOpacity > 0.005 {
-                // Anel LED externo + ponto marcador às 12h girando com o prato para deixar claro o pouso em 0°
-                ZStack {
-                    Circle()
-                        .strokeBorder(
-                            AngularGradient(
-                                colors: [
-                                    ringColor.opacity(0.95),
-                                    Color.white.opacity(0.25),
-                                    ringColor.opacity(0.55),
-                                    Color.white.opacity(0.25),
-                                    ringColor.opacity(0.95)
-                                ],
-                                center: .center
-                            ),
-                            lineWidth: 3.0
-                        )
-                        .shadow(color: ringColor.opacity(0.50), radius: 8)
-
-                    Circle()
-                        .fill(Color.white)
-                        .overlay(Circle().strokeBorder(ringColor, lineWidth: 1.5))
-                        .frame(width: 7, height: 7)
-                        .offset(y: -(targetSide * 0.5 - 6.0))
-                }
-                .frame(width: targetSide, height: targetSide)
-                .rotationEffect(.degrees(spinAngle))
-                .opacity(jogChromeOpacity)
-
-                // Sulco sutil interno de vinil/CDJ
-                Circle()
-                    .strokeBorder(Color.black.opacity(0.38), lineWidth: max(4.0, targetSide * 0.032))
-                    .frame(width: targetSide * 0.94, height: targetSide * 0.94)
-                    .opacity(jogChromeOpacity)
-
-                // Spindle central compacto do prato CDJ
-                ZStack {
-                    Circle()
-                        .fill(Color.black.opacity(0.84))
-                    Circle()
-                        .strokeBorder(ringColor.opacity(0.85), lineWidth: 1.6)
-                    Circle()
-                        .fill(Color(white: 0.80))
-                        .frame(width: targetSide * 0.048, height: targetSide * 0.048)
-                }
-                .frame(width: targetSide * 0.18, height: targetSide * 0.18)
-                .opacity(jogChromeOpacity)
-            }
-        }
-        .frame(width: targetSide, height: targetSide)
-        .shadow(color: .black.opacity(0.55), radius: 22 * scale, y: 10 * scale)
-        .task(id: coverArt) {
-            guard let coverArt else {
-                loadedImage = nil
-                return
-            }
-            if let hit = ImageCache.shared.cachedImage(id: coverArt, size: 600) {
-                loadedImage = hit
-            } else {
-                loadedImage = nil
-                loadedImage = await ImageCache.shared.image(id: coverArt, size: 600, client: auth.client)
             }
         }
     }
@@ -1278,10 +660,10 @@ private extension TransitionPlan {
 }
 
 /// Badge curto, discreto e codificado por cores para indicar estado do Automix:
-/// - `armed`: azul discreto (SINC MM:SS ↑/↓)
-/// - `syncUp`: âmbar/laranja vibrante (SINC ↑ aumentando BPM)
-/// - `syncDown`: ciano/azul elétrico (SINC ↓ reduzindo BPM)
-/// - `syncSteady`: verde esmeralda (SINC = BPM cravado)
+/// - `armed`: azul discreto (SYNC MM:SS ↑/↓)
+/// - `syncUp`: âmbar/laranja vibrante (SYNC ↑ aumentando BPM)
+/// - `syncDown`: ciano/azul elétrico (SYNC ↓ reduzindo BPM)
+/// - `syncSteady`: verde esmeralda (SYNC = BPM cravado)
 /// - `mixOverlap`: verde neon DJ (MIX • EQ)
 /// - `mixThreeBand`: roxo/magenta neon (MIX • 3B)
 /// - `mixQuickCut`: rosa/vermelho punch (MIX • CORTE)
@@ -1600,4 +982,97 @@ struct AutomixStudioSheet: View {
         }
         .preferredColorScheme(.dark)
     }
+}
+
+/// Fundo da tela de reprodução: a capa borrada. O desfoque (caro na GPU) é calculado numa versão 8× menor da
+/// imagem e depois ampliada, o que dá o mesmo visual com ~1/64 dos pixels; e, por ser uma view própria que só
+/// depende da capa, não é recalculada quando a posição da faixa muda.
+private struct AmbientCoverBackground: View {
+    let coverArt: String?
+    private static let shrink: CGFloat = 8
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let coverArt {
+                GeometryReader { geo in
+                    CoverArtView(coverArt: coverArt, size: 300, cornerRadius: 0)
+                        .frame(width: geo.size.width * 1.4 / Self.shrink, height: geo.size.height * 1.2 / Self.shrink)
+                        .blur(radius: 75 / Self.shrink)
+                        .scaleEffect(Self.shrink)
+                        .opacity(0.42)
+                        .position(x: geo.size.width / 2, y: geo.size.height * 0.35)
+                }
+                .ignoresSafeArea()
+            }
+            LinearGradient(
+                colors: [Color.black.opacity(0.25), Color.black.opacity(0.65), Color.black.opacity(0.92)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+        }
+    }
+}
+
+/// Barra de progresso e tempos. É uma view própria de propósito: a posição da faixa muda várias vezes por segundo e,
+/// lendo `player.currentTime` aqui dentro, só esta parte da tela é recalculada (antes era a tela de reprodução inteira).
+private struct NowPlayingScrubberView: View {
+    @Environment(AudioPlayerManager.self) private var player
+    @State private var scrubValue: Double = 0
+    @State private var isDragging = false
+    let onOpenAutomixStudio: () -> Void
+
+    var body: some View {
+        let maxTime = max(player.effectiveScrubberEndTime, 1.0)
+        let current = player.currentTime
+        let activeTime = min(isDragging ? scrubValue : current, maxTime)
+        VStack(spacing: 4) {
+            DJScrubberSlider(
+                value: $scrubValue,
+                maxTime: maxTime,
+                currentTime: current,
+                isDragging: $isDragging,
+                plan: player.shouldUseAutomix ? player.activeTransitionPlan : nil,
+                onEditingChanged: { editing in
+                    player.scrubbing(editing)
+                    if !editing {
+                        player.seek(to: min(scrubValue, maxTime))
+                    }
+                }
+            )
+
+            HStack(alignment: .center) {
+                Text(formatTime(activeTime))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 46, alignment: .leading)
+
+                Spacer()
+
+                if player.currentSong != nil, player.shouldUseAutomix, let badge = player.automixBadge {
+                    Button(action: onOpenAutomixStudio) {
+                        AutomixPillBadgeView(badge: badge)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                Text("-" + formatTime(max(maxTime - activeTime, 0)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 46, alignment: .trailing)
+            }
+            .frame(height: 22)
+        }
+        .onAppear { scrubValue = player.currentTime }
+        .onChange(of: player.currentTime) { _, t in if !isDragging { scrubValue = t } }
+    }
+}
+
+/// Altura livre entre a base da capa e o título da música (medida no `Spacer` entre os dois).
+private struct StageGapKey: PreferenceKey {
+    static let defaultValue: CGFloat = 60
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

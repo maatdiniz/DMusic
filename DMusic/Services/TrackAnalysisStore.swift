@@ -114,7 +114,7 @@ final class TrackAnalysisStore {
     }
 
     /// Atualiza silenciosamente os metadados caso o último sync com o servidor `allin1` tenha mais de `maxAgeSec`.
-    func syncFromServerIfStale(mixClient: MixServerClient?, maxAgeSec: TimeInterval = 45) async {
+    func syncFromServerIfStale(mixClient: MixServerClient?, maxAgeSec: TimeInterval = 600) async {
         guard let mixClient else { return }
         if let last = lastServerSyncAt, Date().timeIntervalSince(last) < maxAgeSec { return }
         await syncFromServer(mixClient: mixClient)
@@ -124,31 +124,58 @@ final class TrackAnalysisStore {
         serverHealth = try? await mixClient.health()
     }
 
+    private struct AnalysisJob {
+        let songId: String
+        let url: URL
+        let onComplete: (@MainActor () -> Void)?
+    }
+    @ObservationIgnored private var pendingJobs: [AnalysisJob] = []
+    @ObservationIgnored private var isAnalyzing = false
+    private static let failedIdsKey = "analysis_failed_ids"
+    /// Faixas que a análise local não conseguiu ler: não tenta de novo a cada abertura do app.
+    @ObservationIgnored private lazy var failedIds: Set<String> = Set(UserDefaults.standard.stringArray(forKey: Self.failedIdsKey) ?? [])
+
     /// Analisa em background um arquivo local caso a música ainda não possua Beatmap + Camelot salvos.
+    /// A análise local (DSP no aparelho) é cara: roda uma faixa por vez, em prioridade mínima, e fica parada no
+    /// Modo Pouca Energia (o servidor já analisou quase toda a biblioteca).
     func analyzeIfNeeded(songId: String, localURL: URL?, onComplete: (@MainActor () -> Void)? = nil) {
         if items[songId] != nil {
             onComplete?()
             return
         }
-        guard !inFlight.contains(songId), let localURL,
-              FileManager.default.fileExists(atPath: localURL.path) else { return }
+        guard !inFlight.contains(songId), !failedIds.contains(songId), let localURL,
+              FileManager.default.fileExists(atPath: localURL.path),
+              !ProcessInfo.processInfo.isLowPowerModeEnabled else { return }
         inFlight.insert(songId)
+        pendingJobs.append(AnalysisJob(songId: songId, url: localURL, onComplete: onComplete))
+        drainAnalysisQueue()
+    }
 
-        Task.detached(priority: .utility) {
-            let result = Self.extractMixMetadata(songId: songId, url: localURL)
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.inFlight.remove(songId)
-                if let result {
-                    self.items[songId] = result
-                    self.save()
-                    onComplete?()
-                }
+    private func drainAnalysisQueue() {
+        guard !isAnalyzing, !pendingJobs.isEmpty else { return }
+        isAnalyzing = true
+        let job = pendingJobs.removeFirst()
+        Task { [weak self] in
+            let songId = job.songId
+            let url = job.url
+            let result = await Task.detached(priority: .background) {
+                Self.extractMixMetadata(songId: songId, url: url)
+            }.value
+            guard let self else { return }
+            self.inFlight.remove(songId)
+            self.isAnalyzing = false
+            if let result {
+                self.items[songId] = result
+                self.save()
+                job.onComplete?()
+            } else {
+                self.failedIds.insert(songId)
+                UserDefaults.standard.set(Array(self.failedIds), forKey: Self.failedIdsKey)
             }
+            self.drainAnalysisQueue()
         }
     }
 
-    /// Garante a análise e retorna os metadados assim que prontos.
     func ensureAnalyzed(songId: String, localURL: URL?) async -> TrackMixMetadata? {
         if let existing = items[songId] { return existing }
         guard let localURL, FileManager.default.fileExists(atPath: localURL.path) else { return nil }

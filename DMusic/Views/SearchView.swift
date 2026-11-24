@@ -42,10 +42,9 @@ struct SearchView: View {
                 if !vm.songs.isEmpty {
                     Section("Músicas") {
                         ForEach(Array(vm.songs.enumerated()), id: \.element.id) { i, s in
-                            Button { player.play(songs: vm.songs, startAt: i, source: .search(query: vm.query)) } label: {
-                                SongRow(song: s, leading: .cover, djContextSongs: vm.songs, djContextSource: .search(query: vm.query))
-                            }
-                                .buttonStyle(.plain)
+                            SongRow(song: s, leading: .cover, djContextSongs: vm.songs, djContextSource: .search(query: vm.query), onPlay: {
+                                player.play(songs: vm.songs, startAt: i, source: .search(query: vm.query))
+                            })
                         }
                     }
                 }

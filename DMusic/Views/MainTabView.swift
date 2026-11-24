@@ -36,7 +36,6 @@ struct MainTabView: View {
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .animation(.easeInOut(duration: 0.2), value: player.currentSong?.id)
-        .artistPickerDialog(inNowPlaying: false)
         .overlay {
             if player.showNowPlaying {
                 NowPlayingView()
@@ -45,6 +44,11 @@ struct MainTabView: View {
             }
         }
         .animation(.spring(duration: 0.36, bounce: 0.08), value: player.showNowPlaying)
+        .overlay {
+            BusyIndicatorOverlay(message: player.busyMessage)
+                .zIndex(20)
+        }
+        .actionMenuHost(player)
     }
 
     private func tabButton(tab: AppTab, title: String, icon: String) -> some View {

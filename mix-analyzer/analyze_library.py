@@ -6,8 +6,18 @@ Analisa a biblioteca local de músicas usando pipeline Produtor-Consumidor no Ma
   - Consumidores leves (CPU paralela): carregam apenas `harmonix-fold0` (1,4 MB) + `librosa`,
     extraindo espectrogramas, beats, downbeats, estrutura, Camelot e energia RMS em paralelo.
 
-Grava cada faixa em `<music-dir>/_dmusic_mix/tracks/<sha1>.json` (com `.ndignore` para o Navidrome)
+Grava cada faixa em `<music-dir>/_diniz_mix/tracks/<sha1>.json` (com `.ndignore` para o Navidrome)
 e envia em tempo real via POST `/api/ingest` ao servidor DMusic Mix (:4534).
+
+Pós-processamento (postprocess.py): grade de tempo constante, BPM exato, tempo 1 por múltiplos critérios,
+seções no downbeat, bar_beat da faixa inteira, energia por percentil da biblioteca, tom (tag > madmom CNN)
+e presença de voz por compasso (stem de voz do demucs).
+
+Modos:
+  (padrão)            analisa faixas novas/alteradas (demucs + allin1 + pós-processamento)
+  --reprocess         refaz só o pós-processamento de todos os JSONs (sem demucs/allin1), usando `allin1_raw`
+  --vocals-backfill   roda o demucs nas faixas sem `vocal_env` para gerar a presença de voz por compasso
+  --sync-only         reenvia os JSONs existentes ao servidor
 """
 
 import argparse
@@ -21,9 +31,13 @@ os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH"
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 from pathlib import Path
 import shutil
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 import unicodedata
+
+# postprocess.py fica ao lado deste script (também nos workers "spawn")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 AUDIO_EXTS = {
     ".flac", ".mp3", ".m4a", ".aiff", ".aif", ".wav", ".ogg", ".opus", ".aac", ".alac", ".wv"
@@ -49,10 +63,10 @@ def track_hash(rel_nfc: str) -> str:
 
 
 def ensure_output_dirs(music_dir: Path) -> Tuple[Path, Path]:
-    legacy_dir = music_dir / "_diniz_mix"
-    sync_dir = music_dir / "_dmusic_mix"
-    if legacy_dir.exists() and not sync_dir.exists():
-        legacy_dir.rename(sync_dir)
+    # O servidor (mix_engine.SYNC_DIR) lê `_diniz_mix`; `_dmusic_mix` só é usado se já existir sozinho.
+    sync_dir = music_dir / "_diniz_mix"
+    if not sync_dir.exists() and (music_dir / "_dmusic_mix").exists():
+        sync_dir = music_dir / "_dmusic_mix"
     tracks_dir = sync_dir / "tracks"
     tracks_dir.mkdir(parents=True, exist_ok=True)
     ndignore = sync_dir / ".ndignore"
@@ -162,69 +176,6 @@ def compute_phrase_points(
             chosen_in = 0.0
 
     return chosen_in, chosen_out
-
-
-def compute_bar_beat_strengths(
-    y,
-    sr: int,
-    duration: float,
-    bpm: float,
-    beats: List[float],
-    downbeats: List[float],
-) -> List[float]:
-    """
-    Calcula a presença real de batida/bumbo (0.0 a 1.0) em cada compasso (`downbeats`),
-    combinando energia de subgrave/kick (35–175 Hz) + ataque percussivo (onset strength).
-    """
-    import librosa
-    import numpy as np
-
-    dbs = sorted(set(round(float(x), 4) for x in downbeats if 0.0 <= float(x) < duration))
-    if len(dbs) < 12:
-        if len(beats) >= 16:
-            dbs = [round(float(x), 4) for x in beats[::4] if 0.0 <= float(x) < duration]
-        else:
-            bar = 4.0 * 60.0 / max(bpm, 60.0)
-            dbs = []
-            t = 0.0
-            while t < duration - 0.1:
-                dbs.append(round(t, 4))
-                t += bar
-
-    if not dbs or len(y) == 0:
-        return []
-
-    S = np.abs(librosa.stft(y, n_fft=1024, hop_length=256)) ** 2
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)
-    low_mask = (freqs >= 35.0) & (freqs <= 175.0)
-    if not np.any(low_mask):
-        return [0.5] * len(dbs)
-
-    low_S = S[low_mask, :]
-    low_env = np.sqrt(np.mean(low_S, axis=0))
-    onset_env = librosa.onset.onset_strength(
-        S=librosa.power_to_db(low_S + 1e-10),
-        sr=sr,
-        hop_length=256,
-    )
-    times = librosa.frames_to_time(np.arange(len(low_env)), sr=sr, hop_length=256)
-    p82_low = max(float(np.percentile(low_env, 82)), 1e-6)
-    p82_ons = max(float(np.percentile(onset_env, 82)), 1e-6)
-
-    bar_scores: List[float] = []
-    for i, t_s in enumerate(dbs):
-        t_e = dbs[i + 1] if i + 1 < len(dbs) else min(duration, t_s + 2.5)
-        idx_s = int(np.searchsorted(times, t_s))
-        idx_e = max(idx_s + 1, int(np.searchsorted(times, t_e)))
-        if idx_s >= len(low_env):
-            bar_scores.append(0.0)
-            continue
-        b_low = float(np.mean(low_env[idx_s:idx_e])) / p82_low
-        b_ons = float(np.mean(onset_env[idx_s:idx_e])) / p82_ons
-        score = round(min(1.0, max(0.0, 0.62 * b_low + 0.38 * b_ons)), 3)
-        bar_scores.append(score)
-
-    return bar_scores
 
 
 def extract_raw_vibe_features(file_path: str, duration: Optional[float] = None) -> List[float]:
@@ -447,6 +398,85 @@ def get_audio_duration(file_path: str) -> float:
         return float(librosa.get_duration(path=file_path))
 
 
+def _compact_vocal_env(env: Optional[dict]) -> Optional[dict]:
+    """Guarda a razão voz/mixagem em dB inteiros (50 ms) no JSON, para o --reprocess recalcular
+    a presença de voz por compasso sem rodar o demucs de novo."""
+    import numpy as np
+
+    if not env:
+        return None
+    db = np.clip(np.round(np.asarray(env["ratio_db"], dtype=float)), -60, 12).astype(int)
+    return {"hop": env["hop"], "ratio_db": db.tolist()}
+
+
+def _expand_vocal_env(compact: Optional[dict]) -> Optional[dict]:
+    if not compact or not compact.get("ratio_db"):
+        return None  # formato antigo (relativo ao pico da própria voz) é descartado
+    return {"hop": float(compact["hop"]), "ratio_db": compact["ratio_db"]}
+
+
+def finalize_analysis(
+    file_path: str,
+    raw: dict,
+    duration: float,
+    y,
+    sr: int,
+    vocal_env: Optional[dict] = None,
+    energy_stats: Optional[dict] = None,
+) -> dict:
+    """Pós-processamento comum (análise completa e --reprocess) a partir do resultado bruto do allin1.
+    `raw` = {"bpm", "beats", "downbeats", "segments"} exatamente como o allin1 devolveu."""
+    import librosa
+    import numpy as np
+    import postprocess as pp
+
+    grid = pp.regularize_grid(raw.get("beats") or [], raw.get("downbeats") or [], duration, y, sr, raw.get("segments") or [])
+    tempo_factor = pp.tempo_factor_for(file_path)  # correção manual de oitava (tempo_overrides.json)
+    if tempo_factor != 1.0:
+        grid = pp.apply_tempo_factor(grid, tempo_factor)
+    beats, downbeats = grid["beats"], grid["downbeats"]
+    bpm = float(grid["bpm"] or raw.get("bpm") or 120.0)
+    if not downbeats and beats:
+        downbeats = beats[::4]
+    segments = pp.snap_segments(raw.get("segments") or [], downbeats, beats, bpm)
+
+    camelot, musical_key, key_source = pp.detect_key(file_path)
+    if not camelot:
+        chroma = librosa.feature.chroma_cqt(y=librosa.effects.harmonic(y, margin=3.0), sr=sr)
+        camelot, musical_key = estimate_camelot_and_key(np.mean(chroma, axis=1))
+        key_source = "chroma"
+
+    energy_raw = pp.energy_features(y, sr)
+    energy = pp.energy_from_stats(energy_raw, energy_stats) if energy_stats else None
+
+    mix_in_sec, mix_out_sec = compute_phrase_points(duration, bpm, beats, downbeats, segments)
+    out = {
+        "bpm": round(bpm, 4),
+        "beats": beats,
+        "downbeats": downbeats,
+        "segments": segments,
+        "grid_mode": grid["grid_mode"],
+        "grid_inliers": grid.get("grid_inliers"),
+        "grid_residual_ms": grid.get("grid_residual_ms"),
+        "phase_shift_ms": grid.get("phase_shift_ms"),
+        "bar_phase": grid.get("bar_phase"),
+        "bar_beat": pp.bar_beat_strengths(y, sr, downbeats, duration),
+        "camelot": camelot,
+        "musical_key": musical_key,
+        "key_source": key_source,
+        "tempo_factor": tempo_factor,
+        "energy_raw": [round(float(x), 6) for x in energy_raw],
+        "mix_in_sec": mix_in_sec,
+        "mix_out_sec": mix_out_sec,
+        "analysis_version": pp.ANALYSIS_VERSION,
+    }
+    if energy is not None:
+        out["energy"] = energy
+    if vocal_env:
+        out["bar_vocal"] = pp.bar_vocal_presence(vocal_env, downbeats, duration)
+    return out
+
+
 def _init_cpu_worker(model_name: str, cpu_threads: int) -> None:
     global _MODEL
     os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
@@ -511,39 +541,34 @@ def analyze_cpu_task(job: Tuple[str, str, str, str, str, str, float, str]) -> di
     except Exception as exc:
         analyzer_name = f"librosa-fallback ({type(exc).__name__})"
     finally:
+        # Lê o envelope do stem de voz antes de apagar os stems (presença de voz por compasso)
+        vocal_env = None
+        if demix_out_str and Path(demix_out_str, "vocals.wav").is_file():
+            import postprocess as pp
+            vocal_env = pp.vocal_envelope(demix_out_str)
         shutil.rmtree(work_root, ignore_errors=True)
 
     duration = get_audio_duration(file_path)
-    y, sr = librosa.load(file_path, sr=22050, mono=True, duration=240.0)
+    # Faixa inteira (antes eram só 240 s e os compassos depois de 4:00 ficavam com bar_beat = 0)
+    y, sr = librosa.load(file_path, sr=22050, mono=True)
 
-    if len(y) > 0:
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        camelot, musical_key = estimate_camelot_and_key(np.mean(chroma, axis=1))
-        rms = librosa.feature.rms(y=y)[0]
-        p75 = float(np.percentile(rms, 75)) if len(rms) > 0 else 0.12
-        energy = round(min(1.0, max(0.0, p75 / 0.38)), 4)
-
-        if not beats or bpm <= 0:
-            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-            bpm_est = float(np.atleast_1d(tempo)[0])
-            if bpm <= 0 and bpm_est > 0:
-                bpm = bpm_est
-            if not beats:
-                beats = [round(float(t), 4) for t in librosa.frames_to_time(beat_frames, sr=sr)]
-    else:
-        camelot, musical_key, energy = "8A", "Am", 0.5
-
+    if not beats or bpm <= 0:
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        bpm_est = float(np.atleast_1d(tempo)[0])
+        if bpm <= 0 and bpm_est > 0:
+            bpm = bpm_est
+        if not beats:
+            beats = [round(float(t), 4) for t in librosa.frames_to_time(beat_frames, sr=sr)]
     if not downbeats and beats:
         downbeats = beats[::4]
-    if bpm <= 0 and len(beats) >= 2:
-        diffs = [beats[i + 1] - beats[i] for i in range(len(beats) - 1) if beats[i + 1] > beats[i]]
-        if diffs:
-            bpm = 60.0 / float(np.median(diffs))
-    if bpm <= 0:
-        bpm = 120.0
 
-    mix_in_sec, mix_out_sec = compute_phrase_points(duration, bpm, beats, downbeats, segments)
-    bar_beat = compute_bar_beat_strengths(y, sr, duration, bpm, beats, downbeats)
+    raw = {"bpm": bpm, "beats": beats, "downbeats": downbeats, "segments": segments}
+    stats_dir = Path(json_path_str).parent.parent
+    energy_stats_path = stats_dir / "energy_stats.json"
+    energy_stats = json.loads(energy_stats_path.read_text(encoding="utf-8")) if energy_stats_path.is_file() else None
+    final = finalize_analysis(file_path, raw, duration, y, sr, vocal_env=vocal_env, energy_stats=energy_stats)
+    if "energy" not in final:
+        final["energy"] = 0.5
 
     vibe_vec: List[float] = []
     try:
@@ -562,17 +587,10 @@ def analyze_cpu_task(job: Tuple[str, str, str, str, str, str, float, str]) -> di
         "size": st.st_size,
         "mtime": st.st_mtime,
         "duration": round(duration, 3),
-        "bpm": round(bpm, 2),
-        "camelot": camelot,
-        "musical_key": musical_key,
-        "energy": energy,
-        "beats": beats,
-        "downbeats": downbeats,
-        "segments": segments,
-        "bar_beat": bar_beat,
+        **final,
         "vibe": vibe_vec,
-        "mix_in_sec": mix_in_sec,
-        "mix_out_sec": mix_out_sec,
+        "vocal_env": _compact_vocal_env(vocal_env),
+        "allin1_raw": raw,
         "analyzer": analyzer_name,
         "analyzed_at": time.time(),
     }
@@ -593,15 +611,200 @@ def analyze_cpu_task(job: Tuple[str, str, str, str, str, str, float, str]) -> di
     return {
         "rel_path": rel_nfc,
         "bpm": payload["bpm"],
-        "camelot": camelot,
-        "energy": energy,
-        "mix_in": mix_in_sec,
-        "mix_out": mix_out_sec,
+        "camelot": payload["camelot"],
+        "energy": payload["energy"],
+        "mix_in": payload["mix_in_sec"],
+        "mix_out": payload["mix_out_sec"],
         "analyzer": analyzer_name,
         "elapsed_demix": round(demix_elapsed, 2),
         "elapsed_cpu": round(time.time() - t0, 2),
         "ingested": ingested,
     }
+
+
+def _library_targets(
+    tracks_dir: Path,
+    music_dir: Path,
+    itunes_tracks_dir: Optional[Path],
+    itunes_music_dir: Optional[Path],
+) -> List[Tuple[Path, Path]]:
+    """(json, áudio) de todas as faixas analisadas: Soulseek (`music_dir`) + iTunes (`rel_path` = "iTunes/...")."""
+    out: List[Tuple[Path, Path]] = []
+    for jp in sorted(tracks_dir.glob("*.json")):
+        try:
+            rel = json.loads(jp.read_text(encoding="utf-8")).get("rel_path", "")
+        except Exception:
+            continue
+        ap = music_dir / rel
+        if ap.is_file():
+            out.append((jp, ap))
+    if itunes_tracks_dir and itunes_tracks_dir.is_dir() and itunes_music_dir and itunes_music_dir.is_dir():
+        for jp in sorted(itunes_tracks_dir.glob("*.json")):
+            try:
+                rel = json.loads(jp.read_text(encoding="utf-8")).get("rel_path", "")
+            except Exception:
+                continue
+            ap = itunes_music_dir / (rel[len("iTunes/"):] if rel.startswith("iTunes/") else rel)
+            if ap.is_file():
+                out.append((jp, ap))
+    return out
+
+
+def _reprocess_job(job: Tuple[str, str]) -> Tuple[str, Optional[dict], str]:
+    json_path, audio_path = job
+    try:
+        import librosa
+
+        d = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        # Sempre parte do resultado bruto do allin1 (idempotente: rodar de novo não acumula ajustes)
+        raw = d.get("allin1_raw") or {
+            "bpm": d.get("bpm"), "beats": d.get("beats") or [], "downbeats": d.get("downbeats") or [],
+            "segments": d.get("segments") or [],
+        }
+        duration = float(d.get("duration") or get_audio_duration(audio_path))
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+        final = finalize_analysis(audio_path, raw, duration, y, sr, vocal_env=_expand_vocal_env(d.get("vocal_env")))
+        d.update(final)
+        d["allin1_raw"] = raw
+        return json_path, d, ""
+    except Exception as exc:
+        return json_path, None, f"{type(exc).__name__}: {exc}"
+
+
+def _post_ingest(server_url: str, payload: dict) -> bool:
+    import requests
+
+    try:
+        r = requests.post(f"{server_url.rstrip('/')}/api/ingest", json=payload, timeout=20)
+        return r.status_code in (200, 202)
+    except Exception:
+        return False
+
+
+def reprocess_library(
+    targets: List[Tuple[Path, Path]],
+    stats_dir: Path,
+    server_url: str,
+    workers: int,
+    out_dir: Optional[Path] = None,
+    partial: bool = False,
+) -> None:
+    """Refaz o pós-processamento de toda a biblioteca sem demucs/allin1. Com `out_dir`, grava as versões novas
+    lá (ensaio) sem tocar nos JSONs originais nem no servidor."""
+    import postprocess as pp
+
+    print(f"Reprocessando {len(targets)} faixas ({workers} workers)...", flush=True)
+    t0 = time.time()
+    results: Dict[str, dict] = {}
+    errors = 0
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx) as ex:
+        futs = [ex.submit(_reprocess_job, (str(jp), str(ap))) for jp, ap in targets]
+        for n, fut in enumerate(as_completed(futs), 1):
+            jp, d, err = fut.result()
+            if d is None:
+                errors += 1
+                print(f"  ERRO {Path(jp).name}: {err}", flush=True)
+            else:
+                results[jp] = d
+            if n % 50 == 0 or n == len(futs):
+                print(f"  [{n}/{len(futs)}] {len(results)} ok, {errors} erros | {n / max(time.time() - t0, 0.1):.2f} faixas/s", flush=True)
+
+    # Energia: percentil do índice combinado na biblioteca inteira.
+    # Num reprocessamento parcial (--only) usa as estatísticas já gravadas, sem recalculá-las nem sobrescrevê-las.
+    keys = list(results.keys())
+    existing_stats_path = stats_dir / "energy_stats.json"
+    if partial and existing_stats_path.is_file():
+        stats = json.loads(existing_stats_path.read_text(encoding="utf-8"))
+        for k in keys:
+            results[k]["energy"] = pp.energy_from_stats(results[k]["energy_raw"], stats)
+    else:
+        scores, stats = pp.energy_scores([results[k]["energy_raw"] for k in keys])
+        for k, e in zip(keys, scores):
+            results[k]["energy"] = e
+        stats_target = (out_dir or stats_dir) / "energy_stats.json"
+        stats_target.parent.mkdir(parents=True, exist_ok=True)
+        stats_target.write_text(json.dumps({**stats, "count": len(keys), "updated_at": time.time()}), encoding="utf-8")
+
+    synced = 0
+    for i, (jp, d) in enumerate(results.items(), 1):
+        dst = (out_dir / Path(jp).name) if out_dir else Path(jp)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f"{dst}.tmp.{os.getpid()}"
+        Path(tmp).write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, dst)
+        if out_dir is None and server_url and _post_ingest(server_url, d):
+            synced += 1
+        if i % 100 == 0 or i == len(results):
+            print(f"  [{i}/{len(results)}] gravados" + ("" if out_dir else f" | {synced} enviados ao servidor"), flush=True)
+    print(f"Reprocessamento concluído em {time.time() - t0:.0f}s ({len(results)} ok, {errors} erros)", flush=True)
+
+
+def vocals_backfill(
+    targets: List[Tuple[Path, Path]],
+    server_url: str,
+    demix_device: str,
+    limit: int = 0,
+    reverse: bool = False,
+    torch_threads: int = 0,
+) -> None:
+    """Roda o demucs nas faixas sem `vocal_env` e grava a presença de voz por compasso (`bar_vocal`).
+
+    Pode rodar em dois processos ao mesmo tempo (ex.: um na GPU/MPS e outro na CPU com `--reverse`):
+    cada JSON é relido logo antes de processar, então um processo pula o que o outro já fez."""
+    import demucs.api
+    import postprocess as pp
+    import torch
+
+    if torch_threads > 0:
+        torch.set_num_threads(torch_threads)
+    order = list(reversed(targets)) if reverse else list(targets)
+    todo = []
+    for jp, ap in order:
+        try:
+            if not (json.loads(jp.read_text(encoding="utf-8")).get("vocal_env") or {}).get("ratio_db"):
+                todo.append((jp, ap))
+        except Exception:
+            continue
+    if limit > 0:
+        todo = todo[:limit]
+    device = demix_device if demix_device != "auto" else ("mps" if torch.backends.mps.is_available() else "cpu")
+    tag = f"{device}{' (reverso)' if reverse else ''}"
+    print(f"Backfill de voz [{tag}]: {len(todo)} faixas sem envelope de voz", flush=True)
+    if not todo:
+        return
+    sep = demucs.api.Separator(model="htdemucs", device=device, progress=False)
+    t0 = time.time()
+    done = 0
+    for n, (jp, ap) in enumerate(todo, 1):
+        try:
+            d = json.loads(jp.read_text(encoding="utf-8"))
+            if (d.get("vocal_env") or {}).get("ratio_db"):
+                continue  # o outro processo já fez esta faixa
+            _, separated = sep.separate_audio_file(ap)
+            stems = {k: t.detach().cpu().numpy().mean(axis=0) for k, t in separated.items()}
+            del separated
+            env = pp.vocal_envelope_from_array(stems["vocals"], sep.samplerate, sum(stems.values()))
+            d = json.loads(jp.read_text(encoding="utf-8"))
+            if (d.get("vocal_env") or {}).get("ratio_db"):
+                continue
+            d["vocal_env"] = _compact_vocal_env(env)
+            if env:
+                d["bar_vocal"] = pp.bar_vocal_presence(env, d.get("downbeats") or [], float(d.get("duration") or 0))
+            tmp = f"{jp}.tmp.{os.getpid()}"
+            Path(tmp).write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, jp)
+            ok = _post_ingest(server_url, d) if server_url else False
+            done += 1
+            rate = done / max(time.time() - t0, 0.1)
+            print(f"[{tag} {n}/{len(todo)}] voz ok | srv:{'ok' if ok else 'falhou'} | {rate * 60:.1f} faixas/min | {d.get('rel_path')}", flush=True)
+        except Exception as exc:
+            print(f"[{tag} {n}/{len(todo)}] ERRO {ap.name}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            if device == "mps":
+                torch.mps.empty_cache()
+            gc.collect()
+    print(f"Backfill de voz [{tag}] concluído: {done} faixas em {(time.time() - t0) / 60:.1f} min", flush=True)
 
 
 def collect_audio_files(music_dir: Path) -> List[Tuple[Path, str]]:
@@ -655,8 +858,8 @@ def _handle_completed(fut: Future, rel_path: str, done_count: int, total_count: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analisador Pipeline GPU+CPU allin1 + librosa (DMusic)")
-    parser.add_argument("--music-dir", default=os.environ.get("DMUSIC_DIR", os.path.expanduser("~/Music")))
-    parser.add_argument("--server-url", default=os.environ.get("DMUSIC_SERVER_URL", "http://localhost:4534"))
+    parser.add_argument("--music-dir", default=os.environ.get("DMUSIC_DIR", os.path.expanduser("~/Soulseek Downloads/complete")))
+    parser.add_argument("--server-url", default=os.environ.get("DMUSIC_SERVER_URL", "http://100.125.12.71:4534"))
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--model", default="harmonix-fold0")
     parser.add_argument("--demix-device", default="auto", choices=["auto", "mps", "cpu"])
@@ -665,17 +868,46 @@ def main() -> None:
     parser.add_argument("--sync-only", action="store_true")
     parser.add_argument("--backfill-vibe", action="store_true", help="Extrai vetor vibe/timbre 24D para toda biblioteca já analisada")
     parser.add_argument("--itunes-dir", default=os.path.expanduser("~/Music/Music/Media.localized/Music"))
+    parser.add_argument("--reprocess", action="store_true", help="Refaz só o pós-processamento (grade, tom, energia...) de todos os JSONs")
+    parser.add_argument("--out-dir", default="", help="Com --reprocess: grava em outra pasta (ensaio), sem alterar JSONs nem servidor")
+    parser.add_argument("--vocals-backfill", action="store_true", help="Roda o demucs nas faixas sem envelope de voz (bar_vocal)")
+    parser.add_argument("--only", default="", help="Com --reprocess: só as faixas cujo caminho contém este trecho (aplica correções de tempo_overrides.json)")
+    parser.add_argument("--reverse", action="store_true", help="Com --vocals-backfill: percorre a lista ao contrário (2º processo)")
+    parser.add_argument("--torch-threads", type=int, default=0, help="Limita as threads do PyTorch (0 = padrão)")
     args = parser.parse_args()
 
     music_dir = Path(args.music_dir).expanduser().resolve()
     if not music_dir.is_dir():
         raise SystemExit(f"Diretório não encontrado: {music_dir}")
 
-    _, tracks_dir = ensure_output_dirs(music_dir)
+    sync_dir, tracks_dir = ensure_output_dirs(music_dir)
+    itunes_tracks = Path(__file__).resolve().parent / "itunes_tracks"
+    itunes_music = Path(args.itunes_dir).expanduser()
+
+    if args.reprocess or args.vocals_backfill:
+        targets = _library_targets(
+            tracks_dir, music_dir,
+            itunes_tracks if itunes_tracks.is_dir() else None,
+            itunes_music if itunes_music.is_dir() else None,
+        )
+        if args.only:
+            needle = unicodedata.normalize("NFC", args.only).lower()
+            targets = [t for t in targets if needle in unicodedata.normalize("NFC", str(t[1])).lower()]
+            print(f"--only \"{args.only}\": {len(targets)} faixa(s)", flush=True)
+        if args.limit > 0:
+            targets = targets[:args.limit]
+        if args.reprocess:
+            reprocess_library(
+                targets, sync_dir, args.server_url, max(1, args.workers),
+                out_dir=Path(args.out_dir).expanduser() if args.out_dir else None,
+                partial=bool(args.only or args.limit),
+            )
+        if args.vocals_backfill:
+            vocals_backfill(targets, args.server_url, args.demix_device, limit=args.limit,
+                            reverse=args.reverse, torch_threads=args.torch_threads)
+        return
 
     if args.backfill_vibe:
-        itunes_tracks = Path(__file__).resolve().parent / "itunes_tracks"
-        itunes_music = Path(args.itunes_dir).expanduser()
         backfill_vibe_library(
             music_dir=music_dir,
             tracks_dir=tracks_dir,

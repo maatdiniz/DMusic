@@ -25,6 +25,16 @@ nonisolated struct MixServerClient: Sendable {
         return try JSONDecoder().decode(MixServerHealth.self, from: data)
     }
 
+    /// Grade de batidas oficial da faixa (a mesma que o servidor usa para decidir e o app para mixar).
+    func fetchTrackGrid(id: String) async throws -> ServerTrackGrid {
+        guard let url = URL(string: "\(baseURL)/api/track/\(id)") else { throw URLError(.badURL) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        return try JSONDecoder().decode(ServerTrackGrid.self, from: data)
+    }
+
     func fetchAllTracks() async throws -> [ServerTrackMixInfo] {
         guard let url = URL(string: "\(baseURL)/api/tracks") else { throw URLError(.badURL) }
         var req = URLRequest(url: url)
@@ -59,5 +69,42 @@ nonisolated struct MixServerClient: Sendable {
         req.timeoutInterval = 8
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+    }
+}
+
+nonisolated struct ServerTrackGrid: Codable, Sendable {
+    let bpm: Double
+    let beats: [Double]
+    let downbeats: [Double]
+}
+
+/// Cache das grades do servidor (memória + `Caches/grids/<id>.json`, válido por 6 h).
+actor TrackGridCache {
+    static let shared = TrackGridCache()
+    private var memory: [String: ServerTrackGrid] = [:]
+    private let dir: URL
+
+    private init() {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        dir = base.appendingPathComponent("grids", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    func grid(for songId: String, client: MixServerClient?) async -> ServerTrackGrid? {
+        if let hit = memory[songId] { return hit }
+        let safe = String(songId.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "_" })
+        let file = dir.appendingPathComponent("\(safe).json")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+           let modified = attrs[.modificationDate] as? Date,
+           Date().timeIntervalSince(modified) < 6 * 3600,
+           let data = try? Data(contentsOf: file),
+           let cached = try? JSONDecoder().decode(ServerTrackGrid.self, from: data) {
+            memory[songId] = cached
+            return cached
+        }
+        guard let client, let fresh = try? await client.fetchTrackGrid(id: songId), !fresh.beats.isEmpty else { return nil }
+        memory[songId] = fresh
+        if let data = try? JSONEncoder().encode(fresh) { try? data.write(to: file, options: .atomic) }
+        return fresh
     }
 }

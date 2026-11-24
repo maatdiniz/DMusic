@@ -62,14 +62,11 @@ struct ArtistDetailView: View {
 
                         LazyVStack(spacing: 0) {
                             ForEach(Array(songs.enumerated()), id: \.element.id) { i, s in
-                                Button {
+                                SongRow(song: s, leading: .cover, djContextSongs: songs, djContextSource: artistSource, onPlay: {
                                     player.play(songs: songs, startAt: i, source: artistSource)
-                                } label: {
-                                    SongRow(song: s, leading: .cover, djContextSongs: songs, djContextSource: artistSource)
-                                        .padding(.horizontal, 16)
-                                        .padding(.vertical, 6)
-                                }
-                                .buttonStyle(.plain)
+                                })
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 6)
                             }
                         }
                     }

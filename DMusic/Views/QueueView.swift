@@ -4,7 +4,7 @@ struct QueueView: View {
     @Environment(AudioPlayerManager.self) private var player
     @Environment(TrackAnalysisStore.self) private var analysisStore
     @Environment(\.dismiss) private var dismiss
-    @State private var showDJOptions = false
+    @State private var djMenu: ActionMenuRequest?
     @State private var showAutomixStudio = false
 
     private let bgColor = Color(red: 0.055, green: 0.058, blue: 0.068)
@@ -79,30 +79,34 @@ struct QueueView: View {
         }
         .background(bgColor.ignoresSafeArea())
         .preferredColorScheme(.dark)
-        .confirmationDialog("Modo DJ", isPresented: $showDJOptions, titleVisibility: .visible) {
-            Button("Nova ordenação inteligente") {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                withAnimation(.easeOut(duration: 0.2)) {
-                    player.enableAutomixAndReorganizeFromCurrent()
-                }
-            }
-            Button("Continuar com a mesma fila") {
-                if !player.automixEnabled {
-                    player.automixEnabled = true
-                }
-            }
-            if player.automixEnabled {
-                Button("Desativar Modo DJ", role: .destructive) {
-                    player.automixEnabled = false
-                }
-            }
-            Button("Cancelar", role: .cancel) {}
-        } message: {
-            Text("Deseja manter a fila atual ou gerar uma nova ordenação inteligente a partir da música que está tocando?")
-        }
+        .actionMenuSheet($djMenu)
         .sheet(isPresented: $showAutomixStudio) {
             AutomixStudioSheet()
         }
+    }
+
+    /// Opções do Modo DJ no painel padrão do app (apresentado localmente: a fila já é um painel).
+    private func presentDJMenu() {
+        let player = self.player
+        var items: [ActionMenuItem] = [
+            ActionMenuItem(title: "Nova ordenação inteligente", subtitle: "Reorganiza a fila a partir da música atual", systemImage: "wand.and.stars", style: .accent) {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                player.enableAutomixAndReorganizeFromCurrent()
+            },
+            ActionMenuItem(title: "Continuar com a mesma fila", systemImage: "arrow.right.circle") {
+                if !player.automixEnabled { player.automixEnabled = true }
+            },
+        ]
+        if player.automixEnabled {
+            items.append(ActionMenuItem(title: "Desativar Modo DJ", systemImage: "power", style: .destructive) {
+                player.automixEnabled = false
+            })
+        }
+        djMenu = ActionMenuRequest(
+            title: "Modo DJ",
+            message: "Deseja manter a fila atual ou gerar uma nova ordenação inteligente a partir da música que está tocando?",
+            sections: [items]
+        )
     }
 
     private var headerBar: some View {
@@ -129,7 +133,7 @@ struct QueueView: View {
             )
             .contentShape(Capsule())
             .onTapGesture {
-                showDJOptions = true
+                presentDJMenu()
             }
             .onLongPressGesture(minimumDuration: 0.42) {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()

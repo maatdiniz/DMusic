@@ -96,25 +96,32 @@ struct LibraryView: View {
         case .playlists:
             LazyVStack(spacing: 0) {
                 ForEach(vm.playlists) { pl in
-                    NavigationLink(value: pl) {
-                        HStack(spacing: 12) {
-                            CoverArtView(coverArt: pl.coverArt, size: 100).frame(width: 56, height: 56)
-                            VStack(alignment: .leading) {
-                                Text(pl.name)
-                                Text("\(pl.songCount ?? 0) músicas").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 0) {
+                        NavigationLink(value: pl) {
+                            HStack(spacing: 12) {
+                                CoverArtView(coverArt: pl.coverArt, size: 100).frame(width: 56, height: 56)
+                                VStack(alignment: .leading) {
+                                    Text(pl.name)
+                                    Text("\(pl.songCount ?? 0) músicas").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
-                        }.padding(.horizontal).padding(.vertical, 6)
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            Task {
-                                try? await auth.client?.deletePlaylist(id: pl.id)
-                                if let c = auth.client { await vm.refreshPlaylists(client: c) }
-                            }
-                        } label: { Label("Excluir playlist", systemImage: "trash") }
+                            .padding(.leading).padding(.vertical, 6)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Button {
+                            presentPlaylistMenu(pl)
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Mais opções da playlist \(pl.name)")
+                        .padding(.trailing, 6)
                     }
                 }
             }
@@ -141,6 +148,30 @@ struct LibraryView: View {
         }
     }
 
+    /// Menu da playlist; a exclusão pede confirmação num segundo passo (submenu).
+    private func presentPlaylistMenu(_ pl: Playlist) {
+        let client = auth.client
+        let vm = self.vm
+        player.actionMenu = ActionMenuRequest(
+            header: ActionMenuHeader(title: pl.name, subtitle: "\(pl.songCount ?? 0) músicas", coverArt: pl.coverArt),
+            sections: [[
+                ActionMenuItem(
+                    title: "Excluir playlist",
+                    systemImage: "trash",
+                    style: .destructive,
+                    children: [
+                        ActionMenuItem(title: "Confirmar exclusão", subtitle: "Isso não pode ser desfeito", systemImage: "trash.fill", style: .destructive) {
+                            Task {
+                                try? await client?.deletePlaylist(id: pl.id)
+                                if let client { await vm.refreshPlaylists(client: client) }
+                            }
+                        }
+                    ]
+                )
+            ]]
+        )
+    }
+
     private var songsList: some View {
         let songsSource = PlaybackSource.library(sectionRaw: LibrarySection.songs.rawValue, title: "Todas as Músicas")
         return VStack(spacing: 12) {
@@ -151,9 +182,11 @@ struct LibraryView: View {
                         return
                     }
                     loadingFullLibrary = true
+                    let busyToken = player.beginBusy("Carregando a biblioteca completa")
                     Task {
                         let all = await vm.loadAllSongs(client: c)
                         loadingFullLibrary = false
+                        player.endBusy(busyToken)
                         if !all.isEmpty {
                             player.playAll(all, source: songsSource)
                         }
@@ -165,9 +198,11 @@ struct LibraryView: View {
                 Button {
                     guard !loadingFullLibrary, let c = auth.client else { return }
                     loadingFullLibrary = true
+                    let busyToken = player.beginBusy("Carregando a biblioteca completa")
                     Task {
                         let all = await vm.loadAllSongs(client: c)
                         loadingFullLibrary = false
+                        player.endBusy(busyToken)
                         player.automixEnabled = false
                         if !all.isEmpty {
                             player.playAll(all, shuffled: true, source: songsSource)
@@ -188,12 +223,14 @@ struct LibraryView: View {
                 Button {
                     guard !loadingFullLibrary, let c = auth.client else { return }
                     loadingFullLibrary = true
+                    let busyToken = player.beginBusy("Carregando a biblioteca completa")
                     Task {
                         async let allTask = vm.loadAllSongs(client: c)
                         async let syncTask: Void = analysisStore.syncFromServerIfStale(mixClient: player.mixClient)
                         let all = await allTask
                         _ = await syncTask
                         loadingFullLibrary = false
+                        player.endBusy(busyToken)
                         player.automixEnabled = true
                         if !all.isEmpty {
                             player.playAll(all, shuffled: true, source: songsSource)
@@ -218,26 +255,26 @@ struct LibraryView: View {
             .buttonStyle(.plain).disabled(vm.songs.isEmpty || loadingFullLibrary).padding(.horizontal)
             LazyVStack(spacing: 0) {
                 ForEach(Array(vm.songs.enumerated()), id: \.element.id) { i, s in
-                    Button {
+                    SongRow(song: s, leading: .cover, djContextSongs: vm.songs, djContextSource: songsSource, onPlay: {
                         if player.shuffle, !vm.hasLoadedAllSongs, let c = auth.client {
                             guard !loadingFullLibrary else { return }
                             loadingFullLibrary = true
+                            let busyToken = player.beginBusy("Carregando a biblioteca completa")
                             Task {
                                 async let allTask = vm.loadAllSongs(client: c)
                                 async let syncTask: Void = analysisStore.syncFromServerIfStale(mixClient: player.mixClient)
                                 let all = await allTask
                                 _ = await syncTask
                                 loadingFullLibrary = false
+                                player.endBusy(busyToken)
                                 let idx = all.firstIndex(where: { $0.id == s.id }) ?? i
                                 player.play(songs: all, startAt: idx, source: songsSource)
                             }
                         } else {
                             player.play(songs: vm.songs, startAt: i, source: songsSource)
                         }
-                    } label: {
-                        SongRow(song: s, leading: .cover, djContextSongs: vm.songs, djContextSource: songsSource).padding(.horizontal).padding(.vertical, 6)
-                    }
-                    .buttonStyle(.plain)
+                    })
+                    .padding(.horizontal).padding(.vertical, 6)
                     .task { if let c = auth.client { await vm.loadMoreIfNeeded(current: s, client: c) } }
                 }
             }
@@ -261,9 +298,10 @@ struct LibraryView: View {
     private func songRows(_ songs: [Song], source: PlaybackSource) -> some View {
         LazyVStack(spacing: 0) {
             ForEach(Array(songs.enumerated()), id: \.element.id) { i, s in
-                Button { player.play(songs: songs, startAt: i, source: source) } label: {
-                    SongRow(song: s, leading: .cover, djContextSongs: songs, djContextSource: source).padding(.horizontal).padding(.vertical, 6)
-                }.buttonStyle(.plain)
+                SongRow(song: s, leading: .cover, djContextSongs: songs, djContextSource: source, onPlay: {
+                    player.play(songs: songs, startAt: i, source: source)
+                })
+                .padding(.horizontal).padding(.vertical, 6)
             }
         }
     }
