@@ -7,6 +7,7 @@ struct DMusicApp: App {
     }
 
     @State private var auth = AppServices.shared.auth
+    @State private var home = AppServices.shared.home
     @State private var player = AppServices.shared.player
     @State private var downloads = AppServices.shared.downloads
     @State private var recents = AppServices.shared.recents
@@ -19,6 +20,7 @@ struct DMusicApp: App {
         WindowGroup {
             RootView()
                 .environment(auth)
+                .environment(home)
                 .environment(player)
                 .environment(downloads)
                 .environment(recents)

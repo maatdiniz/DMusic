@@ -6,6 +6,7 @@ final class AppServices {
     static let shared = AppServices()
 
     let auth = AuthViewModel()
+    let home = HomeViewModel()
     let player = AudioPlayerManager()
     let downloads = DownloadManager()
     let recents = RecentSongsCache()
@@ -23,6 +24,9 @@ final class AppServices {
     func syncClient(force: Bool = false) {
         let currentURL = auth.client?.serverURL
         if didWireOnce, !force, currentURL == wiredServerURL { return }
+        if didWireOnce && currentURL != wiredServerURL {
+            home.reset()
+        }
         didWireOnce = true
         wiredServerURL = currentURL
 

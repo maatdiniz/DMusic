@@ -2,8 +2,8 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AuthViewModel.self) private var auth
+    @Environment(HomeViewModel.self) private var vm
     @Environment(AudioPlayerManager.self) private var player
-    @State private var vm = HomeViewModel()
     @State private var showSettings = false
 
     var body: some View {
