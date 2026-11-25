@@ -28,7 +28,13 @@ Cliente iOS nativo de streaming de música Hi-Res construído em **Swift / Swift
 > - **Era v1.x (v1.0 a v1.8):** A fundação do streaming Hi-Res, recursos offline, Last.fm, rebrand para DMusic e os primeiros experimentos e tentativas de mixagem DJ. Itens experimentais que foram posteriormente descontinuados ou reformulados estão devidamente tachados com suas explicações.
 > - **Era v2.x (a partir da v2.0):** A grande virada arquitetural do **Automix v2** (onde a análise passou a ser pré-computada em grade constante pelo servidor, a CPU despencou de 41% para 11%, os pratos de vinil deram lugar ao novo palco de meias capas retas e o espectrograma estilo Rekordbox entrou em ação).
 
-### v2.1 (Atual) — Espectrograma Rekordbox, Alinhamento 4-Bar e Transição Suave
+### v2.2 (Atual) — Limpeza Estrutural, `CoverStageView` e Otimização de Estado `@Observable`
+- **Consolidação do Palco de Capas (`CoverStageView`):** Remoção definitiva de todo o código legado da era dos pratos giratórios (`DJDeckStageView` / `DJDualJogStageView`, interpolação circular de vinil e constantes de morph), renomeando o módulo e seus estados para `CoverStageView`, `CoverStageMode`, `CoverStageMetrics` e `CoverBPMChip`.
+- **Fim de Invalidações `@Observable` a 60 Hz:** Eliminação de `transitionMixProgress` / `onMixProgress` (que mutavam o `AudioPlayerManager` 60 vezes por segundo durante toda a mixagem sem nenhuma View consumidora) e remoção do array observável `eventLogs` (`AutomixEventLog`), direcionando os logs diretamente ao `AppLogger` sem re-renderizar a árvore SwiftUI.
+- **Remoção de Código Legado v1.x (-310 linhas líquidas):** Exclusão de 10 métodos órfãos de ordenação harmônica e cálculo de fase da antiga v1.2 em `TrackAnalysisStore`, limpeza de `TrackMixBadgeView` no `NowPlayingView` e simplificação de `CoverArtView` e `SmartShuffler`.
+- **Guia e Ajustes Atualizados:** `AutomixGuideView` e `SettingsView` revisados para documentar o Palco de Meias Capas com Halo LED, o Espectrograma RGB estilo Rekordbox e a pontuação real de 0–100 pts do `SmartShuffler` com Vibe 24D.
+
+### v2.1 — Espectrograma Rekordbox, Alinhamento 4-Bar e Transição Suave
 - **Espectrograma Rolante em Tempo Real:** Visualização opcional estilo Rekordbox/djay Pro com formas de onda dinâmicas dos Decks A e B de borda a borda, zoom em compassos (`4 / 6 / 10 BARS`) e contagem regressiva de compassos para o início e término da mixagem.
 - **Phase Lock de 4 Compassos (16 Batidas):** Trava periódica que impede entradas desalinhadas no meio de uma frase musical, garantindo sincronia perfeita no tempo 1 do compasso.
 - **Servo PLL de Fase & BPM Local:** Microajuste em tempo real de fase de bumbos e interpolação de BPM local na janela de transição para compensar faixas de andamento variável.
@@ -98,5 +104,5 @@ Cliente iOS nativo de streaming de música Hi-Res construído em **Swift / Swift
 - `DMusic/Models/` — Modelos OpenSubsonic (`Song`, `Album`, `Artist`, `Playlist`, `PlaybackSource`) e modelos de mixagem (`TransitionPlan`, `CamelotKey`, `ServerTrackMixInfo`).
 - `DMusic/Services/` — `SubsonicClient`, `AudioPlayerManager`, `AutomixAudioEngine`, `SmartShuffler`, `TrackAnalysisStore`, `MixServerClient`, `DownloadManager`, `RecentSongsCache`, `ImageCache`, `LastFMClient`, `ScrobbleManager`, `ArtistParser`, `CacheSettings`.
 - `DMusic/ViewModels/` — `AuthViewModel`, `HomeViewModel`, `LibraryViewModel`, `SearchViewModel`.
-- `DMusic/Views/` & `Components/` — Telas SwiftUI (`NowPlayingView`, `QueueView`, `SettingsView`, `LibraryView`, `AlbumDetailView`, `ArtistDetailView`, `PlaylistDetailView`, `LastFMView`, `MiniPlayerView`, `SongRow`, `CoverArtView`).
+- `DMusic/Views/` & `Components/` — Telas e componentes SwiftUI (`NowPlayingView`, `CoverStageView`, `ScrollingSpectrogramView`, `ActionMenu`, `QueueView`, `SettingsView`, `AutomixGuideView`, `LibraryView`, `AlbumDetailView`, `ArtistDetailView`, `PlaylistDetailView`, `LastFMView`, `MiniPlayerView`, `SongRow`, `CoverArtView`).
 - `mix-analyzer/` — Script Python (`analyze_library.py`) para análise estrutural (`allin1` + `demucs`) e extração de vetor de Vibe 24D (`librosa`).
