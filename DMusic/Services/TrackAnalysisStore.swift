@@ -24,20 +24,12 @@ nonisolated struct TrackMixMetadata: Codable, Hashable, Sendable {
         60.0 / max(effectiveBPM, 60.0)
     }
 
-    var effectiveBeatOffset: Double {
-        beatOffset ?? cueIn.truncatingRemainder(dividingBy: beatPeriod)
-    }
-
     var formattedBPM: String {
         let val = effectiveBPM
         if abs(val - val.rounded()) < 0.05 {
             return String(format: "%.0f", val.rounded())
         }
         return String(format: "%.1f", val)
-    }
-
-    var badgeText: String {
-        "\(formattedBPM) BPM • \(camelot)"
     }
 }
 
@@ -195,183 +187,7 @@ final class TrackAnalysisStore {
         }
     }
 
-    // MARK: - Ordenação Harmônica e Seleção da Melhor Próxima Música (Beatmap + Camelot)
-
-    /// Escolhe na fila o índice da música mais compatível em BPM e Tom Camelot com a faixa atual `anchor`.
-    func bestMatchingUpcomingIndex(for anchor: Song, in queue: [Song], from startIndex: Int) -> Int? {
-        guard startIndex < queue.count, let anchorMeta = items[anchor.id] else { return nil }
-        var bestIdx: Int?
-        var bestScore = -Double.infinity
-
-        let searchLimit = min(queue.count, startIndex + 40)
-        for idx in startIndex..<searchLimit {
-            guard let candMeta = items[queue[idx].id] else { continue }
-            let score = Self.transitionCompatibilityScore(from: anchorMeta, to: candMeta)
-            if score > bestScore {
-                bestScore = score
-                bestIdx = idx
-            }
-        }
-        return bestIdx
-    }
-
-    /// Organiza as músicas priorizando transições suaves de BPM e compatibilidade harmônica na Roda de Camelot.
-    func orderByHarmonicFlow(_ songs: [Song], startingWith first: Song? = nil) -> [Song] {
-        guard songs.count > 2 else { return songs.shuffled() }
-        var pool = songs.shuffled()
-        var ordered: [Song] = []
-        ordered.reserveCapacity(songs.count)
-
-        if let first {
-            if let idx = pool.firstIndex(where: { $0.id == first.id }) {
-                ordered.append(pool.remove(at: idx))
-            } else {
-                ordered.append(first)
-            }
-        } else if let firstAnalyzed = pool.firstIndex(where: { items[$0.id] != nil }) {
-            ordered.append(pool.remove(at: firstAnalyzed))
-        } else {
-            ordered.append(pool.removeFirst())
-        }
-
-        while !pool.isEmpty {
-            let current = ordered.last!
-            guard let curMeta = items[current.id] else {
-                if let nextAnalyzedIdx = pool.firstIndex(where: { items[$0.id] != nil }) {
-                    ordered.append(pool.remove(at: nextAnalyzedIdx))
-                } else {
-                    ordered.append(pool.removeFirst())
-                }
-                continue
-            }
-
-            // Procura entre todas as analisadas disponíveis a melhor combinação real de BPM + Camelot
-            var bestIdx = 0
-            var bestScore = -Double.infinity
-
-            for i in 0..<pool.count {
-                let candidate = pool[i]
-                if let candMeta = items[candidate.id] {
-                    // Pequeno jitter aleatório (0..1.5) apenas para desempatar músicas com mesmo BPM e Camelot
-                    let score = Self.transitionCompatibilityScore(from: curMeta, to: candMeta) + Double.random(in: 0...1.5)
-                    if score > bestScore {
-                        bestScore = score
-                        bestIdx = i
-                    }
-                }
-            }
-
-            if bestScore == -Double.infinity {
-                ordered.append(pool.removeFirst())
-            } else {
-                ordered.append(pool.remove(at: bestIdx))
-            }
-        }
-
-        return ordered
-    }
-
-    /// Calcula pontuação de compatibilidade entre duas faixas (prioriza fortemente BPM próximo + vizinhança Camelot).
-    nonisolated static func transitionCompatibilityScore(from a: TrackMixMetadata, to b: TrackMixMetadata) -> Double {
-        let bpmDiff = effectiveBPMDifference(a.effectiveBPM, b.effectiveBPM)
-        // Diferença > 14% de BPM recebe penalidade forte para evitar misturar gêneros/ritmos incompatíveis
-        let pctDiff = (bpmDiff / max(a.effectiveBPM, 60.0)) * 100.0
-        let bpmPenalty = pctDiff <= 10.0 ? (pctDiff * 3.2) : (32.0 + (pctDiff - 10.0) * 8.0)
-
-        let camDist = camelotDistance(a.camelot, b.camelot)
-        let harmonicBonus: Double
-        switch camDist {
-        case 0: harmonicBonus = 40.0   // Mesma tonalidade (ex.: 8A -> 8A)
-        case 1: harmonicBonus = 34.0   // Vizinho harmônico perfeito (ex.: 8A -> 7A, 9A ou 8B)
-        case 2: harmonicBonus = 14.0   // Mudança de energia compatível (±2 na roda)
-        default: harmonicBonus = -15.0 // Choque tonal
-        }
-
-        var score = harmonicBonus - bpmPenalty
-        if let cos = SmartShuffler.vibeCosine(a.vibe, b.vibe) {
-            // Recompensa fortemente mesma vibe/timbre e penaliza choques de estilo (ex.: piano house -> funk pesado)
-            score += cos * 38.0
-            if cos < 0.15 { score -= 18.0 }
-        }
-        return score
-    }
-
-    nonisolated static func effectiveBPMDifference(_ bpmA: Double, _ bpmB: Double) -> Double {
-        let direct = abs(bpmA - bpmB)
-        let doubleTime = abs(bpmA - (bpmB * 2.0))
-        let halfTime = abs((bpmA * 2.0) - bpmB)
-        return min(direct, min(doubleTime, halfTime))
-    }
-
-    /// Calcula o `rate` exato para a próxima música ter o MESMO período de batida da música atual.
-    nonisolated static func matchedInitialRate(fromBPM currentBPM: Double, toBPM nextBPM: Double) -> Float {
-        guard currentBPM > 40, nextBPM > 40 else { return 1.0 }
-        var targetRatio = currentBPM / nextBPM
-        if targetRatio > 1.45 {
-            targetRatio = (currentBPM * 0.5) / nextBPM
-        } else if targetRatio < 0.68 {
-            targetRatio = (currentBPM * 2.0) / nextBPM
-        }
-        // Permite ajuste de até ±16% com algoritmo espectral
-        guard targetRatio >= 0.84 && targetRatio <= 1.16 else { return 1.0 }
-        return Float(min(max(targetRatio, 0.84), 1.16))
-    }
-
-    /// Calcula o erro de fase entre os beats da faixa A e da faixa B no instante atual, no intervalo `[-0.5, +0.5]` beats.
-    /// Valor positivo significa que a faixa B está atrasada em relação ao beat da faixa A e precisa acelerar levemente.
-    nonisolated static func beatPhaseError(
-        timeA: Double,
-        metaA: TrackMixMetadata,
-        timeB: Double,
-        metaB: TrackMixMetadata
-    ) -> Double {
-        let periodA = metaA.beatPeriod
-        let periodB = metaB.beatPeriod
-        guard periodA > 0.2, periodB > 0.2 else { return 0 }
-
-        var phaseA = ((timeA - metaA.effectiveBeatOffset) / periodA).truncatingRemainder(dividingBy: 1.0)
-        if phaseA < 0 { phaseA += 1.0 }
-
-        var phaseB = ((timeB - metaB.effectiveBeatOffset) / periodB).truncatingRemainder(dividingBy: 1.0)
-        if phaseB < 0 { phaseB += 1.0 }
-
-        var diff = phaseA - phaseB
-        while diff > 0.5 { diff -= 1.0 }
-        while diff < -0.5 { diff += 1.0 }
-        return diff
-    }
-
-    /// Retorna o próximo instante de batida na grade da faixa `meta` a partir de `afterTime`.
-    nonisolated static func nextBeatTimestamp(after afterTime: Double, meta: TrackMixMetadata) -> Double {
-        let period = meta.beatPeriod
-        let offset = meta.effectiveBeatOffset
-        guard period > 0.2 else { return afterTime }
-        let beatsElapsed = ceil((afterTime - offset) / period)
-        return offset + max(0, beatsElapsed) * period
-    }
-
-    nonisolated static func camelotDistance(_ c1: String, _ c2: String) -> Int {
-        guard let p1 = parseCamelot(c1), let p2 = parseCamelot(c2) else { return 6 }
-        if p1.number == p2.number && p1.letter == p2.letter { return 0 }
-        let rawDiff = abs(p1.number - p2.number)
-        let wheelStep = min(rawDiff, 12 - rawDiff)
-        if p1.letter == p2.letter {
-            return wheelStep
-        } else if wheelStep == 0 {
-            return 1
-        } else {
-            return wheelStep + 1
-        }
-    }
-
-    nonisolated private static func parseCamelot(_ code: String) -> (number: Int, letter: Character)? {
-        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard let letter = trimmed.last, (letter == "A" || letter == "B"),
-              let num = Int(trimmed.dropLast()), (1...12).contains(num) else { return nil }
-        return (num, letter)
-    }
-
-    // MARK: - DSP: Beatmapping (BPM Decimal + Fase do Beat + Cue-In/Cue-Out na Grade) & Camelot Key
+    // MARK: - DSP Fallback Local: Beatmapping (BPM Decimal + Fase do Beat + Cue-In/Cue-Out na Grade) & Camelot Key
 
     nonisolated private static func extractMixMetadata(songId: String, url: URL) -> TrackMixMetadata? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }

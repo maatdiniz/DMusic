@@ -216,7 +216,7 @@ struct SettingsView: View {
                     VStack(spacing: 18) {
                         DarkCardSection(
                             "Reprodução",
-                            footer: "O Automix analisa BPM, tonalidade Camelot (1A–12B) e 1º beat das faixas locais (\(analysisStore.items.count) analisadas), sincronizando o ritmo na entrada da próxima música e voltando suavemente à velocidade original. Álbuns ouvidos em ordem mantêm Gapless puro."
+                            footer: "O Automix sincroniza grade constante de batidas, BPM, Roda de Camelot (1A–12B) e Vibe acústico 24D (\(analysisStore.items.count) faixas sincronizadas), alinhando frases musicais de 4 compassos com equalização DJ e saída suave. Álbuns ouvidos em ordem mantêm Gapless puro."
                         ) {
                             DarkMenuPickerRow(
                                 title: "Wi‑Fi",
@@ -437,7 +437,7 @@ struct AutomixLogsView: View {
                     Button("Limpar", role: .destructive) {
                         player.clearLogs()
                     }
-                    .disabled(player.eventLogs.isEmpty && player.lastSmartShuffleLog == nil)
+                    .disabled(player.lastSmartShuffleLog == nil)
                 }
             }
         }
@@ -464,7 +464,7 @@ struct AutomixLogsView: View {
                 } header: {
                     Text("Resumo da Fila Atual")
                 } footer: {
-                    Text("Pontuação de cada encaixe: BPM (até 50 pts, ±15% com Dual-Deck) + Tom Camelot (até 35 pts na Roda de Camelot) + Energia RMS (até 15 pts).")
+                    Text("Pontuação de cada encaixe (0–100 pts): BPM (até 36 pts, ±15%) + Vibe/Timbre 24D (até 36 pts) + Tom Camelot (até 20 pts) + Energia (até 8 pts) + Bônus de Gênero (+4 pts).")
                 }
 
                 Section {

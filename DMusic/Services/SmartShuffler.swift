@@ -213,11 +213,6 @@ nonisolated enum SmartShuffler {
         return (Float(clampedA), Float(min(max(rateB, 0.93), 1.07)))
     }
 
-    /// Mantém compatibilidade simples para quem só consulta rateA.
-    static func bestTargetRateA(bpmA: Double, bpmB: Double) -> Float {
-        bestDualRates(bpmA: bpmA, bpmB: bpmB).rateA
-    }
-
     /// Peso máximo: 35 pontos.
     static func camelotScore(keyA: CamelotKey, keyB: CamelotKey) -> Double {
         let rawDiff = abs(keyA.number - keyB.number)

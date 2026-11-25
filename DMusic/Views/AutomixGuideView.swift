@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Tela de guia visual explicando todas as cores da barra de tempo, pratos DJ, badges abaixo da barra
-/// e todas as curvas de volume, estilos de EQ, filtros e durações disponíveis no Automix.
+/// Tela de guia visual explicando todas as cores da barra de tempo, palco de capas, espectrograma Rekordbox,
+/// badges abaixo da barra e todas as curvas de volume, estilos de EQ, filtros e durações disponíveis no Automix.
 struct AutomixGuideView: View {
     private let purple = Color(red: 0.72, green: 0.36, blue: 1.0)
     private let coral = Color(red: 1.0, green: 0.34, blue: 0.38)
@@ -19,15 +19,15 @@ struct AutomixGuideView: View {
                     color: purple,
                     icon: "arrowtriangle.up.fill",
                     badge: "SYNC",
-                    title: "Aumentando BPM (Barra + Prato)",
-                    detail: "O trecho roxo no final da barra de tempo indica onde a faixa atual acelera até alcançar o BPM da próxima música."
+                    title: "Aumentando BPM (Barra + Halo da Capa)",
+                    detail: "O trecho roxo no final da barra de tempo e o halo de luz na borda da capa indicam onde a faixa atual acelera até alcançar o BPM da próxima música."
                 )
                 GuideColorRow(
                     color: coral,
                     icon: "arrowtriangle.down.fill",
                     badge: "SYNC",
-                    title: "Reduzindo BPM (Barra + Prato)",
-                    detail: "O trecho coral no final da barra mostra onde a faixa atual desacelera até igualar o andamento da próxima."
+                    title: "Reduzindo BPM (Barra + Halo da Capa)",
+                    detail: "O trecho coral no final da barra e o halo na borda da capa mostram onde a faixa atual desacelera até igualar o andamento da próxima."
                 )
                 GuideColorRow(
                     color: Color.white.opacity(0.45),
@@ -40,8 +40,8 @@ struct AutomixGuideView: View {
                     color: green,
                     icon: "equal",
                     badge: "SYNC",
-                    title: "Verde (Reproduzindo / Estável)",
-                    detail: "Indica reprodução normal ou que o BPM já parou de variar e está cravado."
+                    title: "Verde (Sincronizado / Estável)",
+                    detail: "Indica que o BPM já parou de variar e está cravado para a entrada da próxima faixa."
                 )
                 GuideColorRow(
                     color: armedBlue,
@@ -56,28 +56,28 @@ struct AutomixGuideView: View {
 
             Section {
                 GuideColorRow(
-                    color: amber,
-                    icon: "disc.fill",
-                    badge: "PRÉ-ESCUTA",
-                    title: "Prato Laranja (Cue Fantasma)",
-                    detail: "A próxima faixa já está girando preparada nos bastidores antes do ponto exato de entrada."
-                )
-                GuideColorRow(
                     color: green,
-                    icon: "disc.fill",
-                    badge: "AO VIVO",
-                    title: "Prato Verde (Segunda Faixa Ativa)",
-                    detail: "A segunda música entrou de verdade na mixagem e assume como faixa principal."
+                    icon: "square.split.2x1.fill",
+                    badge: "DECK A",
+                    title: "Verde (Faixa A — Saindo)",
+                    detail: "Durante a transição, a capa da faixa A desliza para a esquerda com filete de luz verde na borda (e ocupa o canal superior A no espectrograma)."
                 )
                 GuideColorRow(
-                    color: Color.white.opacity(0.75),
-                    icon: "disc.fill",
-                    badge: "SAINDO",
-                    title: "Prato Neutro (Faixa Anterior)",
-                    detail: "A faixa que está saindo permanece em branco/prata neutro durante a sobreposição até deslizar para fora pela lateral."
+                    color: amber,
+                    icon: "square.split.2x1.fill",
+                    badge: "DECK B",
+                    title: "Âmbar (Faixa B — Entrando)",
+                    detail: "A nova faixa entra pela direita com filete de luz âmbar na borda (e ocupa o canal inferior B no espectrograma) até assumir o centro ao fim do mix."
+                )
+                GuideColorRow(
+                    color: armedBlue,
+                    icon: "waveform",
+                    badge: "REKORDBOX",
+                    title: "Espectrograma RGB & Grade em Compassos",
+                    detail: "Ondas em 3 bandas (Vermelho = Graves/Bumbo, Verde = Médios/Voz, Azul = Agudos), marcadores vermelhos de downbeat (tempo 1) e zoom em 4, 6 ou 10 BARS."
                 )
             } header: {
-                Text("Cores dos Pratos na Transição")
+                Text("Palco de Capas & Espectrograma (Decks A e B)")
             }
 
             Section {

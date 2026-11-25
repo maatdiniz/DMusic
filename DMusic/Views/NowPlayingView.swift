@@ -34,17 +34,17 @@ struct NowPlayingView: View {
                         .padding(.horizontal, -20)
                         .frame(maxWidth: .infinity, minHeight: 280, maxHeight: 440)
                 } else {
-                    DJDualJogStageView(
-                        stageMode: player.djStageMode,
+                    CoverStageView(
+                        stageMode: player.coverStageMode,
                         currentCoverArt: player.currentSong?.coverArt,
-                        deckACoverArt: player.djDeckACoverArt,
-                        deckBCoverArt: player.djDeckBCoverArt,
-                        deckARate: player.djDeckARate,
-                        deckABPM: player.liveAnimatedBPM ?? player.djDeckABPM,
-                        deckBBPM: player.djDeckBBPM,
+                        coverArtA: player.stageCoverArtA,
+                        coverArtB: player.stageCoverArtB,
+                        rateA: player.stageRateA,
+                        bpmA: player.liveAnimatedBPM ?? player.stageBPMA,
+                        bpmB: player.stageBPMB,
                         liveBPMTrend: player.liveBPMTrend,
                         isPlaying: player.isPlaying,
-                        onSettlingFinished: { player.finishDJStageSettling() },
+                        onSettlingFinished: { player.finishCoverStageSettling() },
                         onSwipeNext: { player.next() },
                         onSwipePrevious: { player.previous() },
                         chipGap: stageGap
@@ -277,13 +277,9 @@ struct NowPlayingView: View {
 
                         if let meta = analysisStore.metadata(for: song.id) {
                             // O BPM ao lado do nome da faixa é SEMPRE o BPM fixo original da faixa;
-                            // o único BPM que altera ao vivo na mudança de ritmo aparece nos Decks / Espectrograma.
-                            LiveBPMBadgeView(
-                                staticMix: meta,
-                                liveBPM: nil,
-                                trend: 0
-                            )
-                            .layoutPriority(1)
+                            // o único BPM que altera ao vivo na mudança de ritmo aparece no Palco / Espectrograma.
+                            TrackMixBadgeView(mix: meta)
+                                .layoutPriority(1)
                         }
                     }
                 }
@@ -444,82 +440,15 @@ struct NowPlayingView: View {
     }
 }
 
-/// Pílula compacta com BPM animado em tempo real exibida sob os pratos durante a transição (sem rótulos de Deck/Cue).
-struct DJDeckBPMChip: View {
-    let bpm: Double
-    let trend: Int
-    let accent: Color
-    var blinkOpacity: Double = 1.0
-
-    var body: some View {
-        let formatted = String(format: "%.1f", bpm)
-        let activeBorder = trend != 0
-            ? accent.opacity(0.35 + 0.55 * blinkOpacity)
-            : accent.opacity(0.65)
-        let activeBg = trend != 0
-            ? Color(white: 0.22).opacity(0.55 * (1.0 - blinkOpacity))
-            : Color.clear
-
-        HStack(spacing: 4) {
-            if trend != 0 {
-                Image(systemName: trend > 0 ? "arrowtriangle.up.fill" : "arrowtriangle.down.fill")
-                    .font(.system(size: 7.5, weight: .bold))
-                    .foregroundStyle(accent.opacity(0.45 + 0.55 * blinkOpacity))
-            }
-
-            Text("\(formatted) BPM")
-                .font(.system(size: 10.5, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-                .contentTransition(.numericText(countsDown: trend < 0))
-                .animation(.easeOut(duration: 0.12), value: formatted)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3.5)
-        .background(Color.black.opacity(0.56), in: Capsule(style: .continuous))
-        .background(activeBg, in: Capsule(style: .continuous))
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(activeBorder, lineWidth: 1.0)
-        )
-    }
-}
-
-/// Badge da barra de controle que exibe o BPM discreto e a tonalidade padronizada na paleta suavizada de Camelot (sem bordas).
-private struct LiveBPMBadgeView: View {
-    let staticMix: TrackMixMetadata?
-    let liveBPM: Double?
-    let trend: Int
-
-    private let discreteText = Color.white.opacity(0.72)
-    private let discreteBg = Color.white.opacity(0.10)
+/// Badge do cabeçalho da faixa que exibe o BPM original fixo e a tonalidade padronizada na paleta suavizada de Camelot.
+private struct TrackMixBadgeView: View {
+    let mix: TrackMixMetadata
 
     var body: some View {
         HStack(spacing: 4) {
-            if let liveBPM {
-                let formatted = String(format: "%.1f", liveBPM)
-                HStack(spacing: 3) {
-                    if trend != 0 {
-                        Image(systemName: trend > 0 ? "arrowtriangle.up.fill" : "arrowtriangle.down.fill")
-                            .font(.system(size: 7.5, weight: .bold))
-                    }
-                    Text(formatted)
-                        .monospacedDigit()
-                        .contentTransition(.numericText(countsDown: trend < 0))
-                        .animation(.easeOut(duration: 0.12), value: formatted)
-                    Text("BPM")
-                }
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(discreteBg, in: Capsule())
-                .foregroundStyle(discreteText)
-            } else if let mix = staticMix {
-                QualityBadge(text: "\(mix.formattedBPM) BPM")
-            }
-
-            if let camelot = staticMix?.camelot, !camelot.isEmpty {
-                CamelotBadge(camelot: camelot)
+            QualityBadge(text: "\(mix.formattedBPM) BPM")
+            if !mix.camelot.isEmpty {
+                CamelotBadge(camelot: mix.camelot)
             }
         }
     }

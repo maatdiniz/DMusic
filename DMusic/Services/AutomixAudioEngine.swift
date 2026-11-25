@@ -540,7 +540,6 @@ final class AutomixAudioEngine {
     // Callbacks para o AudioPlayerManager atualizar UI, capa, Lock Screen e scrobble
     var onTimeUpdate: ((Double, Double) -> Void)?
     var onPhaseChanged: ((Phase, TransitionPlan?) -> Void)?
-    var onMixProgress: ((Float) -> Void)?
     /// `(liveBPM, trend)` onde `trend`: `+1` subindo, `-1` descendo, `0` sincronizado/estável. `liveBPM == nil` retorna ao estático.
     var onLiveBPMChanged: ((Double?, Int) -> Void)?
     /// Disparado no exato momento em que a transição começa (`mixStartSec`), quando a Música B entra na mixagem.
@@ -695,10 +694,6 @@ final class AutomixAudioEngine {
             phaseErrorMs: livePhaseErrorMs,
             isPLLCorrecting: isPLLCorrecting
         )
-    }
-
-    func currentTrackTime() -> Double {
-        currentTime(for: activeDeck)
     }
 
     private func validRenderTime(for deck: DeckChannel) -> Double? {
@@ -1562,7 +1557,6 @@ final class AutomixAudioEngine {
             }
 
             applyTransitionDSP(progress: p, plan: plan, outgoing: activeDeck, incoming: incomingDeck, primeOnlyIncoming: false)
-            onMixProgress?(p)
         }
 
         // 4. Fim da transição: promove o Deck B como novo Deck ativo sem interromper o áudio
@@ -1633,9 +1627,9 @@ final class AutomixAudioEngine {
         let filterStyle = AutomixFilterStyle(rawValue: plan.mix.filterStyle ?? "") ?? .hpInHpOut
         let useReverbTail = (plan.mix.reverbTail == true) || (filterStyle == .finalNoiseOut)
 
-        // 2. CURVA DE VOLUME (quando a Faixa A sai em Passa-Alta, mantém volume cheio e deixa o filtro limpar a saída!)
+        // 2. CURVA DE VOLUME
         let volStyle = AutomixVolumeCurve(rawValue: plan.mix.volumeCurve ?? "") ?? .overlap
-        let (volA, volB) = computeVolumes(progress: p, curve: volStyle, filterStyle: filterStyle, oneBarFrac: oneBarFrac)
+        let (volA, volB) = computeVolumes(progress: p, curve: volStyle, oneBarFrac: oneBarFrac)
         if !primeOnlyIncoming {
             // Compensação de potência: com A e B em 100% a soma sobe ~3 dB; reduz os dois decks juntos
             // para manter a potência constante (máx. -3 dB). Em p = 0 e p = 1 o fator volta a 1.0 (sem degrau).
@@ -1660,14 +1654,7 @@ final class AutomixAudioEngine {
         applyFilters(progress: p, style: filterStyle, useReverbTail: useReverbTail, outgoing: outgoing, incoming: incoming, primeOnlyIncoming: primeOnlyIncoming)
     }
 
-    private func computeVolumes(progress p: Float, curve: AutomixVolumeCurve, filterStyle: AutomixFilterStyle, oneBarFrac: Float) -> (Float, Float) {
-        let hasOutgoingFilter: Bool = {
-            switch filterStyle {
-            case .none, .lpIn, .hpIn: return false
-            default: return true
-            }
-        }()
-
+    private func computeVolumes(progress p: Float, curve: AutomixVolumeCurve, oneBarFrac: Float) -> (Float, Float) {
         switch curve {
         case .auto, .overlap:
             // SOBREPOR (3 Fases DJ com saída progressiva e musical — NUNCA corte seco no fim!):

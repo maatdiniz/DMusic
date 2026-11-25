@@ -117,8 +117,6 @@ struct ScrollingSpectrogramView: View {
     @State private var windowBars: Double = 6.0
 
     private let zoomBarSteps: [Double] = [4.0, 6.0, 10.0]
-    private let deckAColor = Color(red: 0.16, green: 0.86, blue: 0.48)
-    private let deckBColor = Color(red: 1.0, green: 0.68, blue: 0.16)
     private static let deckAColor = Color(red: 0.16, green: 0.86, blue: 0.48)
     private static let deckBColor = Color(red: 1.0, green: 0.68, blue: 0.16)
     private static let playheadColor = Color(red: 1.0, green: 0.24, blue: 0.28)
@@ -134,7 +132,7 @@ struct ScrollingSpectrogramView: View {
         let extractKeyB = "\(activeIdB ?? "")|\(player.activeTransitionPlan?.trackB.id ?? "")|\(player.preparedMixHint ?? "")"
 
         // 30 fps basta para a onda rolar com um deck só (≈1,5 px por quadro); 60 fps só durante a mixagem
-        TimelineView(.animation(minimumInterval: player.djStageMode != .idle ? 1.0 / 60.0 : 1.0 / 30.0, paused: !player.isPlaying)) { timeline in
+        TimelineView(.animation(minimumInterval: player.coverStageMode != .idle ? 1.0 / 60.0 : 1.0 / 30.0, paused: !player.isPlaying)) { timeline in
             let liveSnap = player.liveDeckSnapshot()
             let liveDual = (liveSnap.songIdB != nil && (liveSnap.plan != nil || liveSnap.hasStartedIncoming || liveSnap.phase == .ramping || liveSnap.phase == .mixing))
             let cache = spectralCache
@@ -212,7 +210,7 @@ struct ScrollingSpectrogramView: View {
                         .font(.system(size: 10, weight: .black, design: .rounded))
                         .foregroundStyle(.black)
                         .frame(width: 16, height: 16)
-                        .background(deckAColor, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .background(Self.deckAColor, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
 
                     if liveBPMA > 0 {
                         Text(String(format: "%.2f", liveBPMA))
@@ -252,11 +250,11 @@ struct ScrollingSpectrogramView: View {
                             .foregroundStyle(.black)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(deckAColor, in: Capsule())
+                            .background(Self.deckAColor, in: Capsule())
 
                         let absErr = abs(snap.phaseErrorMs)
                         let lockText = absErr < 3.0 ? "SYNC 0ms" : String(format: "AUTO %+.0fms", snap.phaseErrorMs)
-                        let lockCol: Color = absErr < 3.0 ? deckAColor : Color(red: 1.0, green: 0.68, blue: 0.16)
+                        let lockCol: Color = absErr < 3.0 ? Self.deckAColor : Color(red: 1.0, green: 0.68, blue: 0.16)
                         Text(lockText)
                             .font(.system(size: 9.0, weight: .bold, design: .monospaced))
                             .foregroundStyle(lockCol)
@@ -292,28 +290,28 @@ struct ScrollingSpectrogramView: View {
                         .font(.system(size: 10, weight: .black, design: .rounded))
                         .foregroundStyle(.black)
                         .frame(width: 16, height: 16)
-                        .background(deckBColor, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .background(Self.deckBColor, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
 
                     if liveBPMB > 0 {
                         Text(String(format: "%.2f", liveBPMB))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundStyle(deckBColor)
+                            .foregroundStyle(Self.deckBColor)
                             .monospacedDigit()
                     }
 
                     if abs(pitchPctB) >= 0.1 {
                         Text(String(format: "%+.1f%%", pitchPctB))
                             .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                            .foregroundStyle(deckBColor)
+                            .foregroundStyle(Self.deckBColor)
                     }
 
                     if !snap.hasStartedIncoming {
                         Text("CUE")
                             .font(.system(size: 8.5, weight: .black, design: .rounded))
-                            .foregroundStyle(deckBColor)
+                            .foregroundStyle(Self.deckBColor)
                             .padding(.horizontal, 4.5)
                             .padding(.vertical, 1)
-                            .background(deckBColor.opacity(0.18), in: Capsule())
+                            .background(Self.deckBColor.opacity(0.18), in: Capsule())
                     }
 
                     Text(titleB)
@@ -329,11 +327,11 @@ struct ScrollingSpectrogramView: View {
                         let total = Self.mixBars(plan)
                         if snap.hasStartedIncoming {
                             let done = min(max((snap.timeA - plan.trackA.mixStartSec) / barSec, 0), Double(total))
-                            barsPill("\(min(Int(done) + 1, total))/\(total) BARS", color: deckAColor)
+                            barsPill("\(min(Int(done) + 1, total))/\(total) BARS", color: Self.deckAColor)
                         } else {
                             let left = (plan.trackA.mixStartSec - snap.timeA) / barSec
                             if left > 0, left <= 99 {
-                                barsPill("MIX EM \(Int(ceil(left))) BARS", color: deckBColor)
+                                barsPill("MIX EM \(Int(ceil(left))) BARS", color: Self.deckBColor)
                             }
                         }
                     }

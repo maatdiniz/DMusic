@@ -50,44 +50,41 @@ final class AudioPlayerManager {
         didSet {
             UserDefaults.standard.set(automixEnabled, forKey: "automix_enabled")
             if automixEnabled {
-                logEvent(.engine, "Automix ativado", detail: "Fila mantida intacta. Modo Dual-Deck 48 kHz + EQ 5 bandas + Filtros ativo.")
+                logEvent("ENGINE", "Automix ativado", detail: "Fila mantida intacta. Modo Dual-Deck 48 kHz + EQ 5 bandas + Filtros ativo.")
                 Task { await analysisStore?.syncFromServerIfStale(mixClient: mixClient) }
                 onAutomixEnabledMidTrack()
             } else {
-                logEvent(.engine, "Automix desativado", detail: "Fila mantida intacta. Retornando para reprodução Gapless pura.")
+                logEvent("ENGINE", "Automix desativado", detail: "Fila mantida intacta. Retornando para reprodução Gapless pura.")
                 automixPrepareTask?.cancel()
                 automixEngine.clearPreparedIncoming()
-                automixPhaseLabel = nil
+                isAutomixing = false
                 preparedMixHint = nil
                 automixBadge = nil
                 activeTransitionPlan = nil
-                resetDJStage()
+                resetCoverStage()
             }
             preloadNextInGapless()
         }
     }
-    var automixPhaseLabel: String?
+    private(set) var isAutomixing = false
     var preparedMixHint: String?
     /// Badge curto, discreto e colorido exibido na tela de reprodução (ex.: "SYNC ↑", "SYNC ↓", "MIX • 3B", "MIX • EQ").
     var automixBadge: AutomixIndicatorBadge?
     /// Plano de transição armado para a faixa atual (usado para limitar o slider antes da transição e colorir a zona de rampa de BPM).
     var activeTransitionPlan: TransitionPlan?
-    /// Estado visual das duas Jogs A & B na transição DJ (idle -> ramping -> mixing -> settling -> idle).
-    var djStageMode: DJStageMode = .idle
-    var djDeckACoverArt: String? = nil
-    var djDeckBCoverArt: String? = nil
-    var djDeckARate: Float = 1.0
-    /// Progresso contínuo (0.0 a 1.0) da transição entre Jog A e Jog B.
-    var transitionMixProgress: Double = 0
+    /// Estado visual das capas A & B na transição DJ (idle -> ramping -> mixing -> settling -> idle).
+    var coverStageMode: CoverStageMode = .idle
+    var stageCoverArtA: String? = nil
+    var stageCoverArtB: String? = nil
+    var stageRateA: Float = 1.0
     /// BPM efetivo em tempo real durante rampa de sincronização, mixagem ou recuperação pós-transição (`nil` = exibir estático).
     var liveAnimatedBPM: Double? = nil
-    /// Tendência do BPM ao vivo: `+1` subindo (âmbar), `-1` descendo (ciano), `0` cravado/sincronizado (verde).
+    /// Tendência do BPM ao vivo: `+1` subindo (roxo), `-1` descendo (coral), `0` cravado/sincronizado (verde).
     var liveBPMTrend: Int = 0
-    /// BPM exibido sob a Jog A e sob a Jog B no palco dual-deck.
-    var djDeckABPM: Double? = nil
-    var djDeckBBPM: Double? = nil
-    @ObservationIgnored private var djSettleSafetyTask: Task<Void, Never>?
-    var isAutomixing: Bool { automixPhaseLabel != nil }
+    /// BPM exibido sob a Capa A e sob a Capa B no palco.
+    var stageBPMA: Double? = nil
+    var stageBPMB: Double? = nil
+    @ObservationIgnored private var stageSettleSafetyTask: Task<Void, Never>?
 
     // MARK: Menus de ação (painel único na raiz do app)
 
@@ -146,31 +143,30 @@ final class AudioPlayerManager {
     private func publishSmartShuffleLog(_ report: SmartShuffleRunLog, reason: String) {
         lastSmartShuffleLog = report
         logEvent(
-            .shuffle,
+            "SHUFFLE",
             "\(reason) (\(report.totalTracks) faixas • média \(Int(report.averageScore.rounded())) pts)",
             detail: "IA allin1: \(report.aiAnalyzedCount) • Local: \(report.localAnalyzedCount) • Sem análise: \(report.unanalyzedCount)"
         )
     }
 
-    private func resetDJStage(clearLiveBPM: Bool = true) {
-        djSettleSafetyTask?.cancel()
-        djSettleSafetyTask = nil
-        djStageMode = .idle
-        djDeckACoverArt = nil
-        djDeckBCoverArt = nil
-        djDeckARate = 1.0
-        transitionMixProgress = 0.0
-        djDeckABPM = nil
-        djDeckBBPM = nil
+    private func resetCoverStage(clearLiveBPM: Bool = true) {
+        stageSettleSafetyTask?.cancel()
+        stageSettleSafetyTask = nil
+        coverStageMode = .idle
+        stageCoverArtA = nil
+        stageCoverArtB = nil
+        stageRateA = 1.0
+        stageBPMA = nil
+        stageBPMB = nil
         if clearLiveBPM {
             liveAnimatedBPM = nil
             liveBPMTrend = 0
         }
     }
 
-    func finishDJStageSettling() {
-        guard djStageMode == .settling else { return }
-        resetDJStage(clearLiveBPM: false)
+    func finishCoverStageSettling() {
+        guard coverStageMode == .settling else { return }
+        resetCoverStage(clearLiveBPM: false)
     }
 
     /// Snapshot instantâneo O(1) dos dois decks para o Espectrograma Rekordbox a 60 FPS.
@@ -210,19 +206,12 @@ final class AudioPlayerManager {
 
     // MARK: Logs do Sistema Automix & Ordem do Smart Shuffle
     var lastSmartShuffleLog: SmartShuffleRunLog?
-    var eventLogs: [AutomixEventLog] = []
 
-    func logEvent(_ category: AutomixEventLog.Category, _ title: String, detail: String) {
-        let entry = AutomixEventLog(timestamp: Date(), category: category, title: title, detail: detail)
-        eventLogs.insert(entry, at: 0)
-        if eventLogs.count > 250 {
-            eventLogs.removeLast(eventLogs.count - 250)
-        }
-        print("[\(category.rawValue.uppercased())] \(title) — \(detail)")
+    nonisolated private func logEvent(_ category: String, _ title: String, detail: String) {
+        print("[\(category)] \(title) — \(detail)")
     }
 
     func clearLogs() {
-        eventLogs.removeAll()
         lastSmartShuffleLog = nil
         AppLogger.shared.clearLog()
     }
@@ -406,46 +395,43 @@ final class AudioPlayerManager {
             guard let self else { return }
             switch phase {
             case .idle, .playing:
-                self.automixPhaseLabel = nil
-                if self.djStageMode == .ramping {
-                    self.resetDJStage()
+                self.isAutomixing = false
+                if self.coverStageMode == .ramping {
+                    self.resetCoverStage()
                 }
             case .ramping:
+                self.isAutomixing = true
                 let rateA = plan?.sync.targetRateA ?? 1.0
                 if rateA > 1.003 {
-                    self.automixPhaseLabel = "SYNC ↑"
                     self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "arrowtriangle.up.fill", kind: .syncUp)
                 } else if rateA < 0.997 {
-                    self.automixPhaseLabel = "SYNC ↓"
                     self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "arrowtriangle.down.fill", kind: .syncDown)
                 } else {
-                    self.automixPhaseLabel = "SYNC"
                     self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "equal", kind: .syncSteady)
                 }
-                self.djSettleSafetyTask?.cancel()
+                self.stageSettleSafetyTask?.cancel()
                 let nextSongForStage = plan.flatMap { p in self.queue.first(where: { $0.id == p.trackB.id }) } ?? self.nextSongInQueue
-                self.djDeckACoverArt = self.currentSong?.coverArt
-                self.djDeckBCoverArt = nextSongForStage?.coverArt
-                self.djDeckARate = rateA
-                self.transitionMixProgress = 0.0
+                self.stageCoverArtA = self.currentSong?.coverArt
+                self.stageCoverArtB = nextSongForStage?.coverArt
+                self.stageRateA = rateA
                 if let p = plan {
-                    self.djDeckABPM = p.trackA.bpm > 0 ? p.trackA.bpm : nil
+                    self.stageBPMA = p.trackA.bpm > 0 ? p.trackA.bpm : nil
                     let effectiveB = p.trackB.bpm * Double(p.sync.initialRateB ?? 1.0)
-                    self.djDeckBBPM = effectiveB > 0 ? effectiveB : nil
+                    self.stageBPMB = effectiveB > 0 ? effectiveB : nil
                     if p.transitionType == "beatmatch", abs(rateA - 1.0) >= 0.003, p.trackA.bpm > 0 {
                         self.liveAnimatedBPM = p.trackA.bpm
                         self.liveBPMTrend = rateA > 1.0 ? 1 : -1
                     }
                 }
-                self.djStageMode = .ramping
+                self.coverStageMode = .ramping
 
                 if let p = plan {
                     let pct = String(format: "%+.1f%%", (p.sync.targetRateA - 1.0) * 100.0)
-                    self.logEvent(.sync, "Sincronizando BPM (\(pct))", detail: "Rampa iniciada em \(Self.formatMMSS(p.trackA.rampStartSec)) rumo a \(Self.formatMMSS(p.trackA.mixStartSec))")
+                    self.logEvent("SYNC", "Sincronizando BPM (\(pct))", detail: "Rampa iniciada em \(Self.formatMMSS(p.trackA.rampStartSec)) rumo a \(Self.formatMMSS(p.trackA.mixStartSec))")
                 }
             case .mixing:
                 let badge = Self.activeMixingBadge(for: plan)
-                self.automixPhaseLabel = badge.text
+                self.isAutomixing = true
                 self.automixBadge = badge
                 // Deck B já assumiu a barra de progresso — limpa o plano da Faixa A para não desenhar
                 // a zona colorida de rampa da faixa anterior sobre a barra da nova faixa.
@@ -455,7 +441,7 @@ final class AudioPlayerManager {
                     let eq = AutomixEQStyle(rawValue: p.mix.eqStyle ?? "")?.title ?? "Troca de Grave central"
                     let flt = AutomixFilterStyle(rawValue: p.mix.filterStyle ?? "")?.title ?? "Passa-alta"
                     self.logEvent(
-                        .mix,
+                        "MIX",
                         "Mixando (\(p.mix.bars ?? 8) compassos • \(badge.text))",
                         detail: "Saída \(Self.formatMMSS(p.trackA.mixStartSec)) (\(p.trackA.section ?? "inst")) → Entrada \(Self.formatMMSS(p.trackB.entrySec)) (\(p.trackB.section ?? "drop")) | Vol: \(vol) | EQ: \(eq) | Filtro: \(flt)"
                     )
@@ -463,25 +449,19 @@ final class AudioPlayerManager {
             }
         }
 
-        automixEngine.onMixProgress = { [weak self] p in
-            guard let self else { return }
-            self.transitionMixProgress = Double(p)
-        }
-
         automixEngine.onLiveBPMChanged = { [weak self] bpm, trend in
             guard let self else { return }
             self.liveAnimatedBPM = bpm
             self.liveBPMTrend = trend
-            if self.djStageMode == .ramping, let bpm {
-                self.djDeckABPM = bpm
+            if self.coverStageMode == .ramping, let bpm {
+                self.stageBPMA = bpm
                 if trend == 0, let p = self.activeTransitionPlan,
                    p.transitionType == "beatmatch", abs(p.sync.targetRateA - 1.0) >= 0.003 {
-                    self.automixPhaseLabel = "SYNC"
                     self.automixBadge = AutomixIndicatorBadge(text: "SYNC", icon: "equal", kind: .syncSteady)
                 }
-            } else if self.djStageMode == .mixing, let bpm {
-                self.djDeckABPM = bpm
-                self.djDeckBBPM = bpm
+            } else if self.coverStageMode == .mixing, let bpm {
+                self.stageBPMA = bpm
+                self.stageBPMB = bpm
             }
         }
 
@@ -497,21 +477,20 @@ final class AudioPlayerManager {
             }
             guard let idx = resolvedIdx else { return }
 
-            self.djSettleSafetyTask?.cancel()
-            if self.djStageMode != .ramping {
-                self.djDeckACoverArt = previousSong?.coverArt
-                self.djDeckBCoverArt = self.queue[idx].coverArt
-                self.djDeckARate = self.activeTransitionPlan?.sync.targetRateA ?? 1.0
+            self.stageSettleSafetyTask?.cancel()
+            if self.coverStageMode != .ramping {
+                self.stageCoverArtA = previousSong?.coverArt
+                self.stageCoverArtB = self.queue[idx].coverArt
+                self.stageRateA = self.activeTransitionPlan?.sync.targetRateA ?? 1.0
                 if let p = self.activeTransitionPlan {
                     let rateA = p.sync.targetRateA
                     let effectiveA = p.trackA.bpm * Double(rateA)
                     let effectiveB = p.trackB.bpm * Double(p.sync.initialRateB ?? 1.0)
-                    self.djDeckABPM = effectiveA > 0 ? effectiveA : nil
-                    self.djDeckBBPM = effectiveB > 0 ? effectiveB : nil
+                    self.stageBPMA = effectiveA > 0 ? effectiveA : nil
+                    self.stageBPMB = effectiveB > 0 ? effectiveB : nil
                 }
             }
-            self.transitionMixProgress = 0.0
-            self.djStageMode = .mixing
+            self.coverStageMode = .mixing
 
             // Assim que o slider chega ao fim (mixStartSec) e a Música B começa a entrar,
             // a tela já exibe imediatamente a capa, título, artista e tempo da Música B!
@@ -552,20 +531,19 @@ final class AudioPlayerManager {
             }
 
             let finishedSongTitle = self.currentSong?.title ?? ""
-            self.logEvent(.mix, "Transição concluída → \(finishedSongTitle)", detail: "Deck B assumiu como Deck principal sem interrupção.")
+            self.logEvent("MIX", "Transição concluída → \(finishedSongTitle)", detail: "Deck B assumiu como Deck principal sem interrupção.")
 
-            // Entra no estado de desaceleração suave da Jog B até chegar ao centro em tamanho 100% e alinhar em 0°!
-            self.djDeckBCoverArt = self.currentSong?.coverArt
-            self.transitionMixProgress = 1.0
-            self.djStageMode = .settling
-            self.djSettleSafetyTask?.cancel()
-            self.djSettleSafetyTask = Task { [weak self] in
+            // Deslize final da Capa B até o centro mentre a Capa A sai pela esquerda
+            self.stageCoverArtB = self.currentSong?.coverArt
+            self.coverStageMode = .settling
+            self.stageSettleSafetyTask?.cancel()
+            self.stageSettleSafetyTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(4.5))
                 guard !Task.isCancelled else { return }
-                self?.finishDJStageSettling()
+                self?.finishCoverStageSettling()
             }
 
-            self.automixPhaseLabel = nil
+            self.isAutomixing = false
             self.preparedMixHint = nil
             self.automixBadge = nil
             self.activeTransitionPlan = nil
@@ -579,7 +557,7 @@ final class AudioPlayerManager {
             guard let self else { return }
             self.preparedMixHint = nil
             self.activeTransitionPlan = nil
-            self.resetDJStage()
+            self.resetCoverStage()
             if !self.sleepAtEndOfTrack, let nextIdx = self.nextAutoIndex() {
                 self.load(index: nextIdx, autoplay: true)
             } else {
@@ -892,17 +870,6 @@ final class AudioPlayerManager {
         }
     }
 
-    private func recordSmartShuffleLog(songs: [Song], reason: String) {
-        guard let store = analysisStore else { return }
-        let report = SmartShuffler.buildShuffleReport(orderedSongs: songs, metadata: store.items)
-        lastSmartShuffleLog = report
-        logEvent(
-            .shuffle,
-            "\(reason) (\(report.totalTracks) faixas • média \(Int(report.averageScore.rounded())) pts)",
-            detail: "IA allin1: \(report.aiAnalyzedCount) • Local: \(report.localAnalyzedCount) • Sem análise: \(report.unanalyzedCount)"
-        )
-    }
-
     private func albumFallbackArtist(for song: Song) -> String? {
         if case .album(let alb) = playbackSource, alb.id == song.albumId || song.albumId == nil {
             return alb.artist
@@ -936,10 +903,10 @@ final class AudioPlayerManager {
         }
         guard RecentSongsCache.isCorruptAudioFile(url) else { return nil }
         if downloads?.isDownloaded(songId) == true {
-            logEvent(.engine, "Download corrompido", detail: "\(url.lastPathComponent) está zerado/vazio — remova e baixe a faixa novamente.")
+            logEvent("ENGINE", "Download corrompido", detail: "\(url.lastPathComponent) está zerado/vazio — remova e baixe a faixa novamente.")
         } else {
             recents?.evict(id: songId)
-            logEvent(.engine, "Cache corrompido removido", detail: "\(url.lastPathComponent) estava zerado/vazio e será baixado novamente.")
+            logEvent("ENGINE", "Cache corrompido removido", detail: "\(url.lastPathComponent) estava zerado/vazio e será baixado novamente.")
         }
         return nil
     }
@@ -972,11 +939,11 @@ final class AudioPlayerManager {
         automixEngine.stop()
         gaplessPlayer.pause()
         gaplessPlayer.removeAllItems()
-        automixPhaseLabel = nil
+        isAutomixing = false
         preparedMixHint = nil
         automixBadge = nil
         activeTransitionPlan = nil
-        resetDJStage()
+        resetCoverStage()
 
         consumePriority(movingTo: index)
         guard queue.indices.contains(index) else { return }
@@ -1228,7 +1195,7 @@ final class AudioPlayerManager {
             openedB = openEngineFile(for: songB.id)
         }
         guard let fileB = openedB, let localB = localFileURL(for: songB.id) else {
-            logEvent(.engine, "Mix não armado: \(songB.title)", detail: "O arquivo local da próxima faixa não pôde ser aberto pelo AVAudioEngine (formato não suportado ou download falhou).")
+            logEvent("ENGINE", "Mix não armado: \(songB.title)", detail: "O arquivo local da próxima faixa não pôde ser aberto pelo AVAudioEngine (formato não suportado ou download falhou).")
             return
         }
 
@@ -1292,7 +1259,7 @@ final class AudioPlayerManager {
         }
 
         logEvent(
-            resolvedPlan.source == "allin1" ? .server : .engine,
+            resolvedPlan.source == "allin1" ? "SERVIDOR" : "ENGINE",
             "Plano armado: \(songA.title) → \(songB.title)",
             detail: "\(tag) (\(resolvedPlan.mix.bars ?? 8) comp.) | Saída \(outStr) [\(resolvedPlan.trackA.section ?? "inst")] → Entrada \(inStr) [\(resolvedPlan.trackB.section ?? "drop")] | Rate A: \(String(format: "%.3fx", resolvedPlan.sync.targetRateA)) • Rate B: \(String(format: "%.3fx", resolvedPlan.sync.initialRateB ?? 1.0)) | \(fxSummary)"
         )
@@ -1421,8 +1388,8 @@ final class AudioPlayerManager {
         }
         currentTime = clampedSeconds
         if usingEngineMode {
-            automixPhaseLabel = nil
-            resetDJStage()
+            isAutomixing = false
+            resetCoverStage()
             automixEngine.seek(to: clampedSeconds)
             if shouldUseAutomix, let cur = currentSong, let nextSong = nextSongInQueue {
                 // Reaproveita imediatamente o plano já armado em memória (0 ms de espera de rede)
@@ -1560,8 +1527,8 @@ final class AudioPlayerManager {
             automixEngine.clearPreparedIncoming()
             preparedMixHint = nil
             activeTransitionPlan = nil
-            if djStageMode == .ramping {
-                resetDJStage()
+            if coverStageMode == .ramping {
+                resetCoverStage()
             }
             if shouldUseAutomix, let cur = currentSong, let nextSong = nextSongInQueue {
                 automixPrepareTask = Task {
@@ -1722,11 +1689,11 @@ final class AudioPlayerManager {
         gaplessPlayer.pause()
         gaplessPlayer.removeAllItems()
         usingEngineMode = false
-        automixPhaseLabel = nil
+        isAutomixing = false
         preparedMixHint = nil
         automixBadge = nil
         activeTransitionPlan = nil
-        resetDJStage()
+        resetCoverStage()
         activeItem = nil
         preloadedIndex = nil
         itemIndex = [:]

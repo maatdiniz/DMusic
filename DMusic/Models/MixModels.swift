@@ -228,13 +228,13 @@ nonisolated enum AutomixFilterStyle: String, Codable, CaseIterable, Identifiable
     }
 }
 
-// MARK: - Indicador Discreto de SYNC / MIX e Logs do Sistema & Smart Shuffle
+// MARK: - Indicador Discreto de SYNC / MIX e Relatório do Smart Shuffle
 
-nonisolated enum DJStageMode: Equatable, Sendable {
+nonisolated enum CoverStageMode: Equatable, Sendable {
     case idle       // Capa normal (currentSong)
-    case ramping    // Rampa de BPM / Cue: Capa A vira Jog A e vai p/ esquerda; Jog B entra na direita
-    case mixing     // Mixando: Deck A (esquerda) e Deck B (direita) giram juntos; UI já exibe Música B
-    case settling   // Fim da mix: Jog A sai; Jog B vai ao centro, cresce até 100% da capa, freia até 0° e só então vira capa
+    case ramping    // Ajuste de BPM da Faixa A: capa inteira com filete de luz correndo pela borda
+    case mixing     // Mixando: meias capas de borda a borda (Faixa A à esquerda e Faixa B entrando pela direita)
+    case settling   // Fim do mix: Capa A sai pela esquerda e Capa B desliza até o centro
 }
 
 nonisolated struct AutomixIndicatorBadge: Equatable, Sendable {
@@ -287,22 +287,6 @@ nonisolated struct SmartShuffleRunLog: Identifiable, Hashable, Sendable {
     let minScore: Double
     let averageScore: Double
     let steps: [SmartShuffleStepLog]
-}
-
-nonisolated struct AutomixEventLog: Identifiable, Hashable, Sendable {
-    enum Category: String, Sendable {
-        case shuffle = "SHUFFLE"
-        case sync = "SYNC"
-        case mix = "MIX"
-        case engine = "ENGINE"
-        case server = "SERVIDOR"
-    }
-
-    let id = UUID()
-    let timestamp: Date
-    let category: Category
-    let title: String
-    let detail: String
 }
 
 // MARK: - TransitionPlan JSON (Servidor -> App) conforme especificação

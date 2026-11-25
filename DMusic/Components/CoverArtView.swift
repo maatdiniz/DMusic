@@ -4,46 +4,25 @@ struct CoverArtView: View {
     let coverArt: String?
     var size: Int = 300
     var cornerRadius: CGFloat = 8
-    /// Quando `true` (ex.: tela de reprodução `NowPlayingView`), a caixa permanece 100% fixa (1:1)
-    /// e a imagem cabe inteira (`scaledToFit`) centralizada, seja ela horizontal, vertical ou quadrada.
-    var fitInsideSquare: Bool = false
 
     @Environment(AuthViewModel.self) private var auth
     @State private var image: UIImage?
 
     var body: some View {
         let resolvedImage = image ?? coverArt.flatMap { ImageCache.shared.cachedImage(id: $0, size: size) }
-        Group {
-            if fitInsideSquare {
-                Color.clear
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                        if let resolvedImage {
-                            Image(uiImage: resolvedImage)
-                                .resizable()
-                                .scaledToFit()
-                                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                        } else {
-                            placeholder
-                                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                        }
-                    }
-            } else {
-                Color.clear
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                        if let resolvedImage {
-                            Image(uiImage: resolvedImage)
-                                .resizable()
-                                .scaledToFill()
-                        } else {
-                            placeholder
-                        }
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        Color.clear
+            .aspectRatio(1, contentMode: .fit)
+            .overlay {
+                if let resolvedImage {
+                    Image(uiImage: resolvedImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    placeholder
+                }
             }
-        }
-        .task(id: coverArt) {
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .task(id: coverArt) {
             guard let coverArt else {
                 image = nil
                 return

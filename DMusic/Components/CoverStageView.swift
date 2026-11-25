@@ -1,24 +1,24 @@
 import SwiftUI
 
-/// Palco da capa na tela de reprodução. Sem pratos: a capa ganha um filete de luz correndo pela borda.
+/// Palco da capa na tela de reprodução. A capa ganha um filete de luz (halo) correndo pela borda nas transições.
 ///
 /// - `.idle`: capa normal (com deslizar para trocar de faixa).
-/// - `.ramping` (ajuste de BPM da faixa A): a capa continua inteira, com a luz correndo pela borda (cor = BPM subindo,
-///   descendo ou cravado).
+/// - `.ramping` (ajuste de BPM da faixa A): a capa continua inteira, com a luz correndo pela borda (cor = BPM subindo
+///   ou descendo).
 /// - `.mixing` (as duas faixas tocando): o palco vai de borda a borda da tela (sem o recuo lateral); a capa de A desliza
 ///   para a esquerda e a de B entra pela direita, cada uma mostrando cerca de metade, no tamanho normal e com um vão
 ///   entre elas; cada uma com sua luz correndo (verde = A, âmbar = B).
 /// - `.settling`: B desliza até o centro e A sai pela esquerda; a luz de B se apaga e ela fica como a capa atual.
 ///
 /// As capas ficam sempre retas; só a luz da borda se move.
-struct DJDualJogStageView: View {
-    let stageMode: DJStageMode
+struct CoverStageView: View {
+    let stageMode: CoverStageMode
     let currentCoverArt: String?
-    let deckACoverArt: String?
-    let deckBCoverArt: String?
-    let deckARate: Float
-    let deckABPM: Double?
-    let deckBBPM: Double?
+    let coverArtA: String?
+    let coverArtB: String?
+    let rateA: Float
+    let bpmA: Double?
+    let bpmB: Double?
     let liveBPMTrend: Int
     let isPlaying: Bool
     let onSettlingFinished: () -> Void
@@ -31,9 +31,8 @@ struct DJDualJogStageView: View {
 
     // MARK: Cinemática
 
-    private static let cruiseSpeed: Double = 200.0   // °/s ≈ 33⅓ rpm
-    private static let morphDuration = 0.65          // capa → centro do prato
-    private static let slideDelay = 0.50             // o prato começa a deslizar antes do fim do morph
+    private static let haloSpeed: Double = 200.0     // °/s do filete de luz na borda
+    private static let slideDelay = 0.50             // início do deslize lateral das meias capas
     private static let slideDuration = 0.85
     private static let settleSlide = 0.80
     private static let dissolveDelay = 0.55
@@ -44,8 +43,8 @@ struct DJDualJogStageView: View {
     private static let amberLED = Color(red: 1.0, green: 0.62, blue: 0.12)
 
     @State private var phaseStart = Date()
-    @State private var spinStartA: Date?
-    @State private var spinStartB: Date?
+    @State private var haloStartA: Date?
+    @State private var haloStartB: Date?
     @State private var pausedAt: Date?
     @State private var cameFromRamping = false
     /// Luz do ajuste de BPM: acesa só enquanto o BPM está mudando (sobe/desce), apagada depois.
@@ -77,16 +76,16 @@ struct DJDualJogStageView: View {
                     phaseStart = now
                 case .ramping:
                     phaseStart = now.addingTimeInterval(-10)
-                    spinStartA = now.addingTimeInterval(-2)
+                    haloStartA = now.addingTimeInterval(-2)
                 case .mixing:
-                    // A tela foi recriada no meio do mix: já mostra os pratos formados
+                    // A tela foi recriada no meio do mix: já mostra as meias capas posicionadas
                     phaseStart = now.addingTimeInterval(-10)
-                    spinStartA = now.addingTimeInterval(-2)
-                    spinStartB = now.addingTimeInterval(-2)
+                    haloStartA = now.addingTimeInterval(-2)
+                    haloStartB = now.addingTimeInterval(-2)
                 case .settling:
                     phaseStart = now
-                    spinStartA = now.addingTimeInterval(-2)
-                    spinStartB = now.addingTimeInterval(-2)
+                    haloStartA = now.addingTimeInterval(-2)
+                    haloStartB = now.addingTimeInterval(-2)
                     if isPlaying { scheduleSettleFinish(after: Self.settleTotal) }
                 }
             }
@@ -98,22 +97,22 @@ struct DJDualJogStageView: View {
                 phaseStart = now
                 switch newMode {
                 case .idle:
-                    spinStartA = nil
-                    spinStartB = nil
+                    haloStartA = nil
+                    haloStartB = nil
                     cameFromRamping = false
                 case .ramping:
-                    spinStartA = now
-                    spinStartB = nil
+                    haloStartA = now
+                    haloStartB = nil
                     cameFromRamping = false
                     haloOn = liveBPMTrend != 0
                     haloChangedAt = now
                 case .mixing:
                     cameFromRamping = (oldMode == .ramping)
-                    if oldMode != .ramping || spinStartA == nil { spinStartA = now }
-                    spinStartB = now
+                    if oldMode != .ramping || haloStartA == nil { haloStartA = now }
+                    haloStartB = now
                 case .settling:
-                    if spinStartA == nil { spinStartA = now.addingTimeInterval(-2) }
-                    if spinStartB == nil { spinStartB = now.addingTimeInterval(-2) }
+                    if haloStartA == nil { haloStartA = now.addingTimeInterval(-2) }
+                    if haloStartB == nil { haloStartB = now.addingTimeInterval(-2) }
                     if isPlaying { scheduleSettleFinish(after: Self.settleTotal) }
                 }
             }
@@ -136,9 +135,9 @@ struct DJDualJogStageView: View {
                     if let paused = pausedAt {
                         // Desconta o tempo parado para a animação continuar de onde parou
                         let delta = now.timeIntervalSince(paused)
-                        phaseStart = phaseStart.addingTimeInterval(delta)
-                        spinStartA = spinStartA?.addingTimeInterval(delta)
-                        spinStartB = spinStartB?.addingTimeInterval(delta)
+                        phaseStart = clickedPhaseStart(after: delta)
+                        haloStartA = haloStartA?.addingTimeInterval(delta)
+                        haloStartB = haloStartB?.addingTimeInterval(delta)
                         pausedAt = nil
                     }
                     if stageMode == .settling {
@@ -151,6 +150,10 @@ struct DJDualJogStageView: View {
                 settleTask?.cancel()
                 settleTask = nil
             }
+    }
+
+    private func clickedPhaseStart(after delta: TimeInterval) -> Date {
+        phaseStart.addingTimeInterval(delta)
     }
 
     private func scheduleSettleFinish(after delay: Double) {
@@ -171,8 +174,8 @@ struct DJDualJogStageView: View {
 
     private static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
 
-    /// Ângulo (graus) de um prato que acelera até a velocidade de cruzeiro e segue constante.
-    private static func spin(since start: Date?, at date: Date, speed: Double, rampUp: Double) -> Double {
+    /// Ângulo acumulado (graus) do filete de luz que acelera suavemente e percorre a borda da capa.
+    private static func haloAngle(since start: Date?, at date: Date, speed: Double, rampUp: Double) -> Double {
         guard let start else { return 0 }
         let dt = max(0, date.timeIntervalSince(start))
         guard dt > 0 else { return 0 }
@@ -185,8 +188,7 @@ struct DJDualJogStageView: View {
         rate >= 1 ? Color(red: 0.72, green: 0.36, blue: 1.0) : Color(red: 1.0, green: 0.34, blue: 0.38)
     }
 
-    /// Posição vertical (a partir do centro do palco) do indicador de BPM: no vão entre a base da capa e o título,
-    /// um pouco mais perto da capa e sempre com folga do título (que tem folga interna própria).
+    /// Posição vertical (a partir do centro do palco) do indicador de BPM: no vão entre a base da capa e o título.
     private func chipOffsetY(S: CGFloat) -> CGFloat {
         let center = chipGap * 0.42
         return S / 2 + min(max(center, 16), max(chipGap - 30, 16))
@@ -197,8 +199,8 @@ struct DJDualJogStageView: View {
     @ViewBuilder
     private func stageContent(side S: CGFloat, at date: Date) -> some View {
         let t = max(0, date.timeIntervalSince(phaseStart))
-        let angleA = Self.spin(since: spinStartA, at: date, speed: Self.cruiseSpeed * Double(max(deckARate, 0.5)), rampUp: 0.5)
-        let angleB = Self.spin(since: spinStartB, at: date, speed: Self.cruiseSpeed, rampUp: 0.35)
+        let angleA = Self.haloAngle(since: haloStartA, at: date, speed: Self.haloSpeed * Double(max(rateA, 0.5)), rampUp: 0.5)
+        let angleB = Self.haloAngle(since: haloStartB, at: date, speed: Self.haloSpeed, rampUp: 0.35)
 
         switch stageMode {
         case .idle:
@@ -214,7 +216,7 @@ struct DJDualJogStageView: View {
 
     // Capa normal, com deslizar para trocar de faixa
     private func idleStage(S: CGFloat) -> some View {
-        CoverFaceView(coverArt: currentCoverArt, side: S, fill: 0, corner: DJStageMetrics.coverCorner, shadowOpacity: 1)
+        CoverFaceView(coverArt: currentCoverArt, side: S)
             .frame(width: S, height: S)
             .offset(x: coverDragX)
             .gesture(
@@ -245,17 +247,17 @@ struct DJDualJogStageView: View {
     private func rampingStage(S: CGFloat, t: Double, date: Date, angleA: Double) -> some View {
         let sinceChange = date.timeIntervalSince(haloChangedAt)
         let level = haloOn ? Double(Self.ease(sinceChange / 0.4)) : 1 - Double(Self.ease(sinceChange / 0.5))
-        let accent = Self.rampColor(rate: deckARate)
+        let accent = Self.rampColor(rate: rateA)
         let blink = 0.45 + 0.55 * (0.5 + 0.5 * sin(t * 7.0))
         let chipAlpha = Double(Self.ease(t / 0.45))
         return ZStack {
-            CoverFaceView(coverArt: deckACoverArt ?? currentCoverArt, side: S, fill: 0, corner: DJStageMetrics.coverCorner, shadowOpacity: 1)
+            CoverFaceView(coverArt: coverArtA ?? currentCoverArt, side: S)
             if level > 0.01 {
                 CoverHaloRing(side: S, angle: angleA, color: accent)
                     .opacity(level)
             }
-            if let bpm = deckABPM, bpm > 0 {
-                DJDeckBPMChip(bpm: bpm, trend: liveBPMTrend, accent: accent, blinkOpacity: liveBPMTrend != 0 ? blink : 1.0)
+            if let bpm = bpmA, bpm > 0 {
+                CoverBPMChip(bpm: bpm, trend: liveBPMTrend, accent: accent, blinkOpacity: liveBPMTrend != 0 ? blink : 1.0)
                     .offset(y: chipOffsetY(S: S))
                     .opacity(chipAlpha)
             }
@@ -263,38 +265,35 @@ struct DJDualJogStageView: View {
         .frame(width: S, height: S)
     }
 
-    // Capa com a luz correndo pela borda (a mesma do ajuste de BPM)
-    private func lightCover(art: String?, side: CGFloat, angle: Double, color: Color, x: CGFloat,
-                            haloAlpha: Double = 1, shadow: Double = 1, alpha: Double = 1) -> some View {
+    // Capa com a luz correndo pela borda
+    private func lightCover(art: String?, side: CGFloat, angle: Double, color: Color, x: CGFloat, haloAlpha: Double = 1) -> some View {
         ZStack {
-            CoverFaceView(coverArt: art, side: side, fill: 0, corner: DJStageMetrics.coverCorner, shadowOpacity: shadow)
+            CoverFaceView(coverArt: art, side: side)
             CoverHaloRing(side: side, angle: angle, color: color)
                 .opacity(haloAlpha)
         }
         .offset(x: x)
-        .opacity(alpha)
     }
 
     // As duas faixas tocando: metade de cada capa, no tamanho normal, com um vão entre elas e indo até as bordas da tela.
-    // O deslize é por tempo (não acompanha o progresso do mix).
     private func mixingStage(S: CGFloat, t: Double, angleA: Double, angleB: Double) -> some View {
-        let W = S + 2 * edgeBleed                                   // largura inteira da tela (sem o recuo lateral)
-        let half = (S + DJStageMetrics.coverGap) / 2                // centro de cada capa quando as duas estão em repouso
+        let W = S + 2 * edgeBleed                                       // largura inteira da tela (sem o recuo lateral)
+        let half = (S + CoverStageMetrics.coverGap) / 2                 // centro de cada capa quando as duas estão em repouso
         let slide = Self.ease((t - Self.slideDelay) / Self.slideDuration)
-        let xA = -half * slide                                      // A vai para a esquerda: sobra a parte da direita
-        let xB = Self.lerp(W / 2 + S / 2, half, slide)              // B entra pela direita, de fora da tela
+        let xA = -half * slide                                          // A vai para a esquerda: sobra a parte da direita
+        let xB = Self.lerp(W / 2 + S / 2, half, slide)                  // B entra pela direita, de fora da tela
         // A luz do ajuste de BPM (se estava acesa) se apaga; só então acende a verde, que é da troca de faixa
         let rampCarry = (cameFromRamping && haloOn) ? 1 - Double(Self.ease(t / 0.35)) : 0
-        let haloA = Double(Self.ease((t - Self.slideDelay) / 0.35))   // acende junto com o deslize, não antes
+        let haloA = Double(Self.ease((t - Self.slideDelay) / 0.35))     // acende junto com o deslize, não antes
         let chipAlpha = Double(Self.ease((t - 0.45) / 0.4))
         let chipY = chipOffsetY(S: S)
 
         return ZStack {
             ZStack {
-                lightCover(art: deckBCoverArt ?? currentCoverArt, side: S, angle: angleB, color: Self.amberLED, x: xB)
-                lightCover(art: deckACoverArt ?? currentCoverArt, side: S, angle: angleA, color: Self.greenLED, x: xA, haloAlpha: haloA)
+                lightCover(art: coverArtB ?? currentCoverArt, side: S, angle: angleB, color: Self.amberLED, x: xB)
+                lightCover(art: coverArtA ?? currentCoverArt, side: S, angle: angleA, color: Self.greenLED, x: xA, haloAlpha: haloA)
                 if rampCarry > 0.01 {
-                    CoverHaloRing(side: S, angle: angleA, color: Self.rampColor(rate: deckARate))
+                    CoverHaloRing(side: S, angle: angleA, color: Self.rampColor(rate: rateA))
                         .opacity(rampCarry)
                         .offset(x: xA)
                 }
@@ -304,13 +303,13 @@ struct DJDualJogStageView: View {
 
             if chipAlpha > 0.01 {
                 // Cada indicador de BPM fica no centro da parte visível da sua capa
-                if let bpm = deckABPM, bpm > 0 {
-                    DJDeckBPMChip(bpm: bpm, trend: 0, accent: Self.greenLED)
+                if let bpm = bpmA, bpm > 0 {
+                    CoverBPMChip(bpm: bpm, trend: 0, accent: Self.greenLED)
                         .offset(x: (-W / 2 + xA + S / 2) / 2, y: chipY)
                         .opacity(chipAlpha)
                 }
-                if let bpm = deckBBPM, bpm > 0 {
-                    DJDeckBPMChip(bpm: bpm, trend: 0, accent: Self.amberLED)
+                if let bpm = bpmB, bpm > 0 {
+                    CoverBPMChip(bpm: bpm, trend: 0, accent: Self.amberLED)
                         .offset(x: (xB - S / 2 + W / 2) / 2, y: chipY)
                         .opacity(chipAlpha)
                 }
@@ -322,7 +321,7 @@ struct DJDualJogStageView: View {
     // Fim do mix: B vai ao centro, A sai pela esquerda e a luz de B se apaga; as capas nunca mudam de tamanho
     private func settlingStage(S: CGFloat, t: Double, angleA: Double, angleB: Double) -> some View {
         let W = S + 2 * edgeBleed
-        let half = (S + DJStageMetrics.coverGap) / 2
+        let half = (S + CoverStageMetrics.coverGap) / 2
         let slide = Self.ease(t / Self.settleSlide)
         let xB = Self.lerp(half, 0, slide)
         let xA = Self.lerp(-half, -(W / 2 + S / 2), slide)          // sai de vez pela esquerda
@@ -332,16 +331,16 @@ struct DJDualJogStageView: View {
         return ZStack {
             ZStack {
                 if slide < 0.99 {
-                    lightCover(art: deckACoverArt, side: S, angle: angleA, color: Self.greenLED, x: xA)
+                    lightCover(art: coverArtA, side: S, angle: angleA, color: Self.greenLED, x: xA)
                 }
-                lightCover(art: deckBCoverArt ?? currentCoverArt, side: S, angle: angleB, color: Self.amberLED, x: xB,
+                lightCover(art: coverArtB ?? currentCoverArt, side: S, angle: angleB, color: Self.amberLED, x: xB,
                            haloAlpha: Double(1 - dissolve))
             }
             .frame(width: W, height: S)
             .mask { Rectangle().frame(width: W, height: S * 1.5) }
 
-            if chipFade > 0.01, let bpm = deckBBPM, bpm > 0 {
-                DJDeckBPMChip(bpm: bpm, trend: 0, accent: Self.amberLED)
+            if chipFade > 0.01, let bpm = bpmB, bpm > 0 {
+                CoverBPMChip(bpm: bpm, trend: 0, accent: Self.amberLED)
                     .offset(x: xB / 2, y: chipOffsetY(S: S))
                     .opacity(chipFade)
             }
@@ -352,34 +351,70 @@ struct DJDualJogStageView: View {
 
 // MARK: - Medidas
 
-enum DJStageMetrics {
+enum CoverStageMetrics {
     /// Raio dos cantos das capas do palco: quase reto, para aparecer o máximo possível da arte.
     static let coverCorner: CGFloat = 3
     /// Vão entre as duas capas durante a mixagem.
     static let coverGap: CGFloat = 22
 }
 
+// MARK: - Pílula de BPM sob a capa
+
+/// Pílula compacta com BPM animado em tempo real exibida sob as capas durante a rampa e a transição.
+struct CoverBPMChip: View {
+    let bpm: Double
+    let trend: Int
+    let accent: Color
+    var blinkOpacity: Double = 1.0
+
+    var body: some View {
+        let formatted = String(format: "%.1f", bpm)
+        let activeBorder = trend != 0
+            ? accent.opacity(0.35 + 0.55 * blinkOpacity)
+            : accent.opacity(0.65)
+        let activeBg = trend != 0
+            ? Color(white: 0.22).opacity(0.55 * (1.0 - blinkOpacity))
+            : Color.clear
+
+        HStack(spacing: 4) {
+            if trend != 0 {
+                Image(systemName: trend > 0 ? "arrowtriangle.up.fill" : "arrowtriangle.down.fill")
+                    .font(.system(size: 7.5, weight: .bold))
+                    .foregroundStyle(accent.opacity(0.45 + 0.55 * blinkOpacity))
+            }
+
+            Text("\(formatted) BPM")
+                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .contentTransition(.numericText(countsDown: trend < 0))
+                .animation(.easeOut(duration: 0.12), value: formatted)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3.5)
+        .background(Color.black.opacity(0.56), in: Capsule(style: .continuous))
+        .background(activeBg, in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(activeBorder, lineWidth: 1.0)
+        )
+    }
+}
+
 // MARK: - Capa (sempre reta)
 
-/// Capa que interpola entre "cabe inteira num quadrado" (`fill = 0`) e "preenche a caixa" (`fill = 1`),
-/// com raio de canto livre (vira círculo quando `corner == side / 2`).
 private struct CoverFaceView: View {
     let coverArt: String?
     let side: CGFloat
-    let fill: CGFloat
-    let corner: CGFloat
-    var shadowOpacity: Double = 0
 
     @Environment(AuthViewModel.self) private var auth
     @State private var loadedImage: UIImage?
 
     var body: some View {
         let target = max(side, 1)
-        let m = min(max(fill, 0), 1)
         let image = loadedImage ?? coverArt.flatMap { ImageCache.shared.cachedImage(id: $0, size: 600) }
-        let (fitW, fitH) = Self.fitted(image, target: target)
-        let boxW = fitW + (target - fitW) * m
-        let boxH = fitH + (target - fitH) * m
+        let (boxW, boxH) = Self.fitted(image, target: target)
+        let corner = CoverStageMetrics.coverCorner
 
         Group {
             if let image {
@@ -397,7 +432,7 @@ private struct CoverFaceView: View {
         }
         .frame(width: boxW, height: boxH)
         .clipShape(RoundedRectangle(cornerRadius: min(corner, min(boxW, boxH) / 2), style: .continuous))
-        .shadow(color: .black.opacity(0.55 * shadowOpacity), radius: 22 * min(target / 300, 1.2), y: 10)
+        .shadow(color: .black.opacity(0.55), radius: 22 * min(target / 300, 1.2), y: 10)
         .frame(width: target, height: target)
         .task(id: coverArt) {
             guard let coverArt else { loadedImage = nil; return }
@@ -417,16 +452,16 @@ private struct CoverFaceView: View {
     }
 }
 
-// MARK: - Filete de luz na borda da capa (fase de ajuste de BPM)
+// MARK: - Filete de luz na borda da capa
 
-/// Dois filetes de luz correndo pela borda da capa, um em cada lado, na velocidade do prato que vai entrar.
+/// Dois filetes de luz correndo pela borda da capa, um em cada lado.
 private struct CoverHaloRing: View {
     let side: CGFloat
     let angle: Double
     let color: Color
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: DJStageMetrics.coverCorner + 2, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: CoverStageMetrics.coverCorner + 2, style: .continuous)
         let p = (angle / 360).truncatingRemainder(dividingBy: 1)
         let length = 0.14
         ZStack {
@@ -455,13 +490,13 @@ private struct CoverHaloRing: View {
 
 // MARK: - Previews
 
-private struct DJStagePreview: View {
-    let mode: DJStageMode
+private struct CoverStagePreview: View {
+    let mode: CoverStageMode
     var body: some View {
-        DJDualJogStageView(
+        CoverStageView(
             stageMode: mode,
-            currentCoverArt: nil, deckACoverArt: nil, deckBCoverArt: nil,
-            deckARate: 1.03, deckABPM: 142.4, deckBBPM: 142.4, liveBPMTrend: 1,
+            currentCoverArt: nil, coverArtA: nil, coverArtB: nil,
+            rateA: 1.03, bpmA: 142.4, bpmB: 142.4, liveBPMTrend: 1,
             isPlaying: true,
             onSettlingFinished: {}, onSwipeNext: {}, onSwipePrevious: {}
         )
@@ -474,6 +509,6 @@ private struct DJStagePreview: View {
     }
 }
 
-#Preview("Mixando (meias capas)") { DJStagePreview(mode: .mixing) }
-#Preview("Ajuste de BPM") { DJStagePreview(mode: .ramping) }
-#Preview("Capa") { DJStagePreview(mode: .idle) }
+#Preview("Mixando (meias capas)") { CoverStagePreview(mode: .mixing) }
+#Preview("Ajuste de BPM") { CoverStagePreview(mode: .ramping) }
+#Preview("Capa") { CoverStagePreview(mode: .idle) }
