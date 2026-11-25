@@ -9,6 +9,8 @@ DerivedData/
 # Python / Analyzer local artifacts & personal library data
 mix-analyzer/.venv/
 mix-analyzer/__pycache__/
+mix-server/__pycache__/
+*.pyc
 # Logs
 *.log
 mix-analyzer/scan.log

@@ -1605,6 +1605,20 @@ final class AutomixAudioEngine {
 
     // MARK: - Processamento DSP Completo (Volume + EQ + Filtros + Reverb)
 
+    /// Quando (fração do mix, 0…1) a faixa que SAI começa a perder cada coisa. A batida de A (o grave, que carrega o
+    /// bumbo) é mantida até a metade do mix: antes o grave saía em 24–34% e o resto só em 62–66%, então a batida de A
+    /// sumia cedo e ela ficava só com médios e agudos por boa parte da transição.
+    private enum OutgoingHold {
+        static let bassSwapCenter: Float = 0.55   // troca de graves A → B
+        static let bassSwapWidth: Float = 0.12
+        static let midOutStart: Float = 0.72      // médios de A recuam (EQ de 3 bandas)
+        static let midOutSpan: Float = 0.26
+        static let highOutStart: Float = 0.76     // agudos de A recuam (EQ de 3 bandas)
+        static let highOutSpan: Float = 0.22
+        static let filterStart: Float = 0.70      // varredura do filtro de saída de A
+        static let volumeStart: Float = 0.74      // fade de volume de A na curva "Sobrepor"
+    }
+
     private func applyTransitionDSP(
         progress p: Float,
         plan: TransitionPlan,
@@ -1658,10 +1672,12 @@ final class AutomixAudioEngine {
         case .auto, .overlap:
             // SOBREPOR (3 Fases DJ com saída progressiva e musical — NUNCA corte seco no fim!):
             // Fase 1 (0.00..0.22): Faixa B sobe até 100% de potência.
-            // Fase 2 (0.22..0.66): AMBAS tocam juntas em 100% de potência (convivência plena das duas faixas).
-            // Fase 3 (0.66..1.00): Faixa A desliza suavemente em curva cosseno de 100% até 0% junto com o filtro de saída!
+            // Fase 2 (0.22..0.74): AMBAS tocam juntas em 100% de potência (convivência plena das duas faixas).
+            // Fase 3 (0.74..1.00): Faixa A desliza suavemente em curva cosseno de 100% até 0% junto com o filtro de saída!
             let vB = p < 0.22 ? sin((p / 0.22) * (.pi / 2.0)) : 1.0
-            let vA: Float = p < 0.66 ? 1.0 : cos(((p - 0.66) / 0.34) * (.pi / 2.0))
+            let vA: Float = p < OutgoingHold.volumeStart
+                ? 1.0
+                : cos(((p - OutgoingHold.volumeStart) / (1.0 - OutgoingHold.volumeStart)) * (.pi / 2.0))
             return (vA, vB)
 
         case .smoothCrossfade:
@@ -1746,24 +1762,24 @@ final class AutomixAudioEngine {
 
         switch style {
         case .auto, .centerBassSwap:
-            // Troca de Grave cedo (32%) para a B já atingir potência total e conviver com a A por um bom tempo
-            applyBassWindow(center: 0.32, width: 0.10)
+            // Troca de grave no meio do mix: a batida de A é mantida até lá, e a de B assume em seguida
+            applyBassWindow(center: OutgoingHold.bassSwapCenter, width: OutgoingHold.bassSwapWidth)
 
         case .startBassSwap:
-            applyBassWindow(center: 0.18, width: 0.10)
+            applyBassWindow(center: 0.38, width: 0.10)
 
         case .endBassSwap:
             applyBassWindow(center: 0.65, width: 0.12)
 
         case .quickBassCut:
-            applyBassWindow(center: 0.32, width: 0.03)
+            applyBassWindow(center: OutgoingHold.bassSwapCenter, width: 0.03)
 
         case .longBassCut:
-            applyBassWindow(center: 0.38, width: 0.45)
+            applyBassWindow(center: 0.55, width: 0.40)
 
         case .bassFadeOut:
-            let sA = min(max(p / 0.45, 0.0), 1.0)
-            let sB = min(max((p - 0.15) / 0.30, 0.0), 1.0)
+            let sA = min(max((p - 0.20) / 0.50, 0.0), 1.0)
+            let sB = min(max((p - 0.35) / 0.35, 0.0), 1.0)
             if !primeOnlyIncoming {
                 outBands[0].gain = cutDb * sA
                 outBands[1].gain = 0.0
@@ -1775,14 +1791,15 @@ final class AutomixAudioEngine {
 
         case .threeBandTransition:
             // Transição de 3 Bandas (3 Fases DJ):
-            // 1º (0.00..0.32): Agudos, Médios e Graves da B chegam a 100% de potência cedo!
-            // 2º (0.32..0.64): Ambas tocam juntas com a A clara em médios/agudos e B em potência total!
-            // 3º (0.64..1.00): Médios e agudos da A recuam de verdade junto com o fade de volume e o filtro de saída.
-            let lowS = min(max((p - 0.24) / 0.10, 0.0), 1.0)
+            // 1º (0.00..0.49): Médios e agudos da B entram cedo; a A segue inteira, com a batida (grave) dela.
+            // 2º (0.49..0.61): Troca de grave: a batida de A passa para a de B.
+            // 3º (0.72..1.00): Médios e agudos da A recuam junto com o filtro de saída e o fade de volume.
+            let bassLo = OutgoingHold.bassSwapCenter - OutgoingHold.bassSwapWidth / 2
+            let lowS = min(max((p - bassLo) / OutgoingHold.bassSwapWidth, 0.0), 1.0)
             let midInS = min(max((p - 0.06) / 0.22, 0.0), 1.0)
-            let midOutS = min(max((p - 0.64) / 0.34, 0.0), 1.0)
+            let midOutS = min(max((p - OutgoingHold.midOutStart) / OutgoingHold.midOutSpan, 0.0), 1.0)
             let highInS = min(max(p / 0.16, 0.0), 1.0)
-            let highOutS = min(max((p - 0.70) / 0.28, 0.0), 1.0)
+            let highOutS = min(max((p - OutgoingHold.highOutStart) / OutgoingHold.highOutSpan, 0.0), 1.0)
 
             let midCutIn: Float = -10.0
             let highCutIn: Float = -8.0
@@ -1826,9 +1843,9 @@ final class AutomixAudioEngine {
 
         // Fase 1 (0.00..0.24): filtro de entrada da B abre completamente cedo para ela já tocar em potência total!
         let inSweep = min(max(p / 0.24, 0.0), 1.0)
-        // Fase 2 (0.24..0.62): AMBAS tocam juntas sem filtro na A (convivência plena das duas faixas)!
-        // Fase 3 (0.62..1.00): filtro de saída da Faixa A varre profundamente junto com o decaimento de volume.
-        let outSweep = min(max((p - 0.62) / 0.38, 0.0), 1.0)
+        // Fase 2 (0.24..0.70): AMBAS tocam juntas sem filtro na A (convivência plena das duas faixas)!
+        // Fase 3 (0.70..1.00): filtro de saída da Faixa A varre junto com o decaimento de volume.
+        let outSweep = min(max((p - OutgoingHold.filterStart) / (1.0 - OutgoingHold.filterStart), 0.0), 1.0)
 
         switch style {
         case .none:

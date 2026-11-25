@@ -113,9 +113,10 @@ struct ScrollingSpectrogramView: View {
     /// Cache indexado por `songId` para nunca apagar a onda do Deck A quando `currentSong` muda para a Faixa B no início do mix.
     @State private var spectralCache: [String: TrackSpectralData] = [:]
     @State private var model = SpectrogramLaneModel()
-    @State private var windowSeconds: Double = 8.0 // Zoom: 6s, 8s, 14s
+    /// Zoom em compassos (a janela de tempo acompanha o BPM, então a grade fica sempre do mesmo tamanho na tela)
+    @State private var windowBars: Double = 6.0
 
-    private let zoomSteps: [Double] = [6.0, 8.0, 14.0]
+    private let zoomBarSteps: [Double] = [4.0, 6.0, 10.0]
     private let deckAColor = Color(red: 0.16, green: 0.86, blue: 0.48)
     private let deckBColor = Color(red: 1.0, green: 0.68, blue: 0.16)
     private static let deckAColor = Color(red: 0.16, green: 0.86, blue: 0.48)
@@ -139,8 +140,11 @@ struct ScrollingSpectrogramView: View {
             let cache = spectralCache
             let _ = model.update(now: timeline.date, snap: liveSnap, dual: liveDual, hasData: { cache[$0] != nil })
             let lanes = model.lanes
-            let window = windowSeconds
             let plan = liveSnap.plan
+            // Janela em segundos = compassos visíveis × duração de um compasso de A (no andamento atual, com o pitch)
+            let bpmA = liveSnap.nominalBPMA > 0 ? liveSnap.nominalBPMA
+                : (plan?.trackA.bpm ?? liveSnap.songIdA.flatMap { analysisStore.metadata(for: $0)?.effectiveBPM } ?? 124.0)
+            let window = windowBars * 240.0 / (max(bpmA, 60.0) * Double(max(liveSnap.rateA, 0.5)))
 
             VStack(spacing: 0) {
                 rekordboxHeader(snap: liveSnap, showDual: liveDual)
@@ -263,15 +267,15 @@ struct ScrollingSpectrogramView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
                 }
 
-                // Zoom cíclico (6s / 8s / 14s)
+                // Zoom cíclico (4 / 6 / 10 compassos)
                 Button {
-                    if let idx = zoomSteps.firstIndex(of: windowSeconds) {
-                        windowSeconds = zoomSteps[(idx + 1) % zoomSteps.count]
+                    if let idx = zoomBarSteps.firstIndex(of: windowBars) {
+                        windowBars = zoomBarSteps[(idx + 1) % zoomBarSteps.count]
                     } else {
-                        windowSeconds = 8.0
+                        windowBars = 6.0
                     }
                 } label: {
-                    Text("\(Int(windowSeconds))s")
+                    Text("\(Int(windowBars)) BARS")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.8))
                         .padding(.horizontal, 7)
@@ -318,6 +322,21 @@ struct ScrollingSpectrogramView: View {
                         .lineLimit(1)
 
                     Spacer(minLength: 0)
+
+                    // A transição é contada em compassos (bars), não em segundos
+                    if let plan = snap.plan, plan.trackA.bpm > 0 {
+                        let barSec = 240.0 / plan.trackA.bpm
+                        let total = Self.mixBars(plan)
+                        if snap.hasStartedIncoming {
+                            let done = min(max((snap.timeA - plan.trackA.mixStartSec) / barSec, 0), Double(total))
+                            barsPill("\(min(Int(done) + 1, total))/\(total) BARS", color: deckAColor)
+                        } else {
+                            let left = (plan.trackA.mixStartSec - snap.timeA) / barSec
+                            if left > 0, left <= 99 {
+                                barsPill("MIX EM \(Int(ceil(left))) BARS", color: deckBColor)
+                            }
+                        }
+                    }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -327,6 +346,24 @@ struct ScrollingSpectrogramView: View {
         .background(Color(red: 0.075, green: 0.082, blue: 0.105))
         .animation(.easeInOut(duration: 0.30), value: showDual)
         .animation(.easeInOut(duration: 0.22), value: snap.phase)
+    }
+
+    /// Compassos da mixagem: o valor do plano ou, na falta dele, a duração convertida pelo BPM de A.
+    private static func mixBars(_ plan: TransitionPlan) -> Int {
+        if let bars = plan.mix.bars, bars > 0 { return bars }
+        guard plan.trackA.bpm > 0 else { return 1 }
+        return max(1, Int(((plan.trackA.mixEndSec - plan.trackA.mixStartSec) * plan.trackA.bpm / 240.0).rounded()))
+    }
+
+    private func barsPill(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+            .monospacedDigit()
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.16), in: Capsule())
+            .transition(.opacity)
     }
 
     // MARK: - Desenho dos canais (estático e sem estado: não depende de isolamento de ator)
@@ -413,14 +450,22 @@ struct ScrollingSpectrogramView: View {
             let tMin = max(0.0, currentTime - visWallLeft * rate - 0.1)
             let tMax = min(data.duration, currentTime + visWallRight * rate + 0.1)
 
+            // Legenda da zona, em compassos
+            func tag(_ text: String, x: CGFloat, color: Color) {
+                let t = layer.resolve(Text(text).font(.system(size: 9.5, weight: .heavy, design: .monospaced)).foregroundColor(color.opacity(0.9)))
+                layer.draw(t, at: CGPoint(x: x, y: rect.minY + 5), anchor: .topLeading)
+            }
+
             // 1. Zona de mixagem e de rampa de BPM planejadas
             if let plan {
+                let bars = mixBars(plan)
                 if plan.trackA.id == lane.id {
                     let xMix0 = xForTrackTime(plan.trackA.mixStartSec)
                     let xMix1 = xForTrackTime(plan.trackA.mixEndSec)
                     if xMix1 > rect.minX && xMix0 < rect.maxX {
                         let r = CGRect(x: max(rect.minX, xMix0), y: rect.minY, width: min(rect.maxX, xMix1) - max(rect.minX, xMix0), height: rect.height)
                         layer.fill(Path(r), with: .color(deckAColor.opacity(0.10)))
+                        if r.width > 56 { tag("\(bars) BARS", x: r.minX + 6, color: deckAColor) }
                     }
                     if plan.trackA.rampStartSec < plan.trackA.mixStartSec - 0.2 && abs(plan.sync.targetRateA - 1.0) >= 0.003 {
                         let xR0 = xForTrackTime(plan.trackA.rampStartSec)
@@ -429,14 +474,19 @@ struct ScrollingSpectrogramView: View {
                             let color: Color = plan.sync.targetRateA > 1.0 ? Color(red: 0.72, green: 0.36, blue: 1.0) : Color(red: 1.0, green: 0.34, blue: 0.38)
                             let r = CGRect(x: max(rect.minX, xR0), y: rect.minY, width: min(rect.maxX, xR1) - max(rect.minX, xR0), height: rect.height)
                             layer.fill(Path(r), with: .color(color.opacity(0.10)))
+                            let rampBars = max(1, Int(((min(plan.trackA.mixStartSec, plan.trackA.rampStartSec + plan.sync.rampDurationSec) - plan.trackA.rampStartSec) * plan.trackA.bpm / 240.0).rounded()))
+                            if r.width > 70 { tag("SYNC \(rampBars) BARS", x: r.minX + 6, color: color) }
                         }
                     }
                 } else if plan.trackB.id == lane.id {
+                    // A zona de B tem o mesmo número de compassos da mixagem (em segundos do arquivo de B: compassos × 240 / BPM de B)
+                    let bBpm = plan.trackB.bpm > 0 ? plan.trackB.bpm : max(plan.trackA.bpm, 60)
                     let xIn0 = xForTrackTime(plan.trackB.entrySec)
-                    let xIn1 = xForTrackTime(plan.trackB.entrySec + plan.mix.durationSec)
+                    let xIn1 = xForTrackTime(plan.trackB.entrySec + Double(bars) * 240.0 / bBpm)
                     if xIn1 > rect.minX && xIn0 < rect.maxX {
                         let r = CGRect(x: max(rect.minX, xIn0), y: rect.minY, width: min(rect.maxX, xIn1) - max(rect.minX, xIn0), height: rect.height)
                         layer.fill(Path(r), with: .color(deckBColor.opacity(0.10)))
+                        if r.width > 56 { tag("\(bars) BARS", x: r.minX + 6, color: deckBColor) }
                     }
                 }
             }

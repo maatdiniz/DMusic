@@ -170,6 +170,43 @@ def _robust_bpm_from_beats(beats: List[float], fallback_bpm: float) -> float:
     return round(exact, 4)
 
 
+def _local_bpm(beats: List[float], t0: float, t1: float, global_bpm: float) -> float:
+    """BPM por regressão das batidas dentro de [t0, t1].
+
+    Faixas de grade `variable` (andamento que oscila) têm um BPM global quantizado que erra 1–5% na janela
+    onde o mix realmente acontece; como a Faixa B toca a 1.0x, esse erro vira batidas fora de sincronia.
+    Só devolve o valor local se o ajuste for confiável (>= 80% das batidas a <= 35 ms da reta) e
+    plausível (a até 6% do BPM global); caso contrário mantém o global.
+    """
+    s = [float(x) for x in beats if t0 <= float(x) <= t1]
+    if len(s) < 12 or global_bpm <= 0:
+        return global_bpm
+    ks = list(range(len(s)))
+
+    def fit(idx: List[int]) -> Tuple[float, float]:
+        n = len(idx)
+        mk = sum(ks[i] for i in idx) / n
+        mt = sum(s[i] for i in idx) / n
+        sxx = sum((ks[i] - mk) ** 2 for i in idx) or 1e-9
+        sl = sum((ks[i] - mk) * (s[i] - mt) for i in idx) / sxx
+        return sl, mt - sl * mk
+
+    keep = ks
+    sl, ic = fit(keep)
+    for _ in range(3):
+        k2 = [i for i in ks if abs(s[i] - (ic + sl * i)) <= 0.035]
+        if len(k2) < 10:
+            return global_bpm
+        keep = k2
+        sl, ic = fit(keep)
+    if sl <= 0 or len(keep) < 0.8 * len(s):
+        return global_bpm
+    local = 60.0 / sl
+    if abs(local - global_bpm) / global_bpm > 0.06:
+        return global_bpm
+    return round(local, 4)
+
+
 def _track_bpm(payload_bpm: float, beats: List[float], analysis_version: int) -> float:
     """Análise v2 já traz o BPM exato da grade constante; dados antigos passam pela regressão robusta."""
     if analysis_version >= 2 and payload_bpm and payload_bpm > 0:
@@ -1056,6 +1093,15 @@ def compute_transition(track_a: dict, track_b: dict, bars_override: Optional[int
                 },
             },
         }
+
+    # BPM local da janela do mix: corrige faixas de andamento oscilante (grade `variable`)
+    bar_a_g, bar_b_g = 240.0 / bpm_a, 240.0 / bpm_b
+    local_a = _local_bpm(beats_a, mix_start - 8 * bar_a_g, mix_end + 2 * bar_a_g, bpm_a)
+    local_b = _local_bpm(beats_b, entry_sec - 2 * bar_b_g, entry_sec + (mix_bars + 2) * bar_b_g, bpm_b)
+    if abs(local_a - bpm_a) > 1e-6 or abs(local_b - bpm_b) > 1e-6:
+        bpm_a, bpm_b = local_a, local_b
+        eff_bpm_b = min([bpm_b, bpm_b * 2.0, bpm_b * 0.5], key=lambda c: abs(c - bpm_a) / max(bpm_a, 1e-6))
+        nom_ratio = eff_bpm_b / max(bpm_a, 1e-6)
 
     # Usa sempre a razão real entre os BPMs das faixas para que a Faixa A pare exatamente no BPM da Faixa B
     chosen_ratio = nom_ratio
