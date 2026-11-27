@@ -26,6 +26,31 @@ struct QualityBadge: View {
     }
 }
 
+/// Selo de conteúdo explícito (tag do arquivo): quadrado com "E", ao lado do título.
+struct ExplicitBadge: View {
+    var body: some View {
+        Text("E")
+            .font(.system(size: 9, weight: .heavy, design: .rounded))
+            .foregroundStyle(Color.black.opacity(0.78))
+            .frame(width: 14, height: 14)
+            .background(Color.white.opacity(0.62), in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+            .accessibilityLabel("Explícita")
+    }
+}
+
+/// Indicador discreto de alta fidelidade (substitui o texto detalhado de formato/qualidade nas listas).
+struct HiResTag: View {
+    var body: some View {
+        Text("HI-RES")
+            .font(.system(size: 9, weight: .heavy, design: .rounded))
+            .foregroundStyle(Color(red: 0.90, green: 0.78, blue: 0.42))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(Color(red: 0.90, green: 0.78, blue: 0.42).opacity(0.14), in: Capsule())
+            .accessibilityLabel("Alta fidelidade")
+    }
+}
+
 /// Tag padronizada de tonalidade Camelot (apenas número e letra na cor suavizada da roda, sem borda).
 struct CamelotBadge: View {
     let camelot: String
@@ -65,9 +90,10 @@ struct SongRow: View {
     @State private var isPressed = false
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             switch leading {
             case .number:
+                // Número gravado na tag da faixa (ID3), não a posição na lista
                 Text(song.track.map(String.init) ?? "–")
                     .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
                     .frame(width: 26)
@@ -75,36 +101,47 @@ struct SongRow: View {
                 CoverArtView(coverArt: song.coverArt, size: 100, cornerRadius: 4).frame(width: 44, height: 44)
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text(song.title).font(.subheadline.weight(.medium))
-                    .foregroundStyle(player.currentSong?.id == song.id ? Color.accentColor : .primary)
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    if let q = song.qualityText { QualityBadge(text: q, highlighted: song.isHiRes) }
-                    if let mix = analysisStore.metadata(for: song.id) {
-                        QualityBadge(text: "\(mix.formattedBPM) BPM")
-                    }
-                    let artistText = ArtistParser.displayString(for: song)
-                    if !artistText.isEmpty, (leading == .cover || ArtistParser.artists(for: song).count > 1) {
-                        Text(artistText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
+                HStack(spacing: 5) {
+                    Text(song.title).font(.subheadline.weight(.medium))
+                        .foregroundStyle(player.currentSong?.id == song.id ? Color.accentColor : .primary)
+                        .lineLimit(1)
+                    if song.isExplicit { ExplicitBadge() }
+                }
+                let artistText = ArtistParser.displayString(for: song)
+                if !artistText.isEmpty, (leading == .cover || ArtistParser.artists(for: song).count > 1) {
+                    Text(artistText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            Spacer()
-            if favorites.isFavorite(song.id) {
-                Image(systemName: "heart.fill").font(.caption2).foregroundStyle(Color.accentColor)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Coluna fixa à direita, sempre em duas linhas: qualidade/BPM/tom em cima; estado e duração embaixo
+            VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: 4) {
+                    if song.isHiRes { HiResTag() }
+                    if let mix = analysisStore.metadata(for: song.id) {
+                        QualityBadge(text: mix.formattedBPM)
+                        CamelotBadge(camelot: mix.camelot)
+                    }
+                }
+                .frame(height: 17)
+                HStack(spacing: 5) {
+                    if favorites.isFavorite(song.id) {
+                        Image(systemName: "heart.fill").font(.system(size: 10)).foregroundStyle(Color.accentColor)
+                    }
+                    if downloads.isDownloading(song.id) {
+                        ProgressView().controlSize(.mini)
+                    } else if downloads.isDownloaded(song.id) {
+                        Image(systemName: "arrow.down.circle.fill").font(.system(size: 11)).foregroundStyle(Color.accentColor)
+                    }
+                    Text(formatTime(Double(song.duration ?? 0)))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                .frame(height: 17)
             }
-            if downloads.isDownloading(song.id) {
-                ProgressView().controlSize(.small)
-            } else if downloads.isDownloaded(song.id) {
-                Image(systemName: "arrow.down.circle.fill").font(.footnote).foregroundStyle(Color.accentColor)
-            }
-            if let mix = analysisStore.metadata(for: song.id) {
-                CamelotBadge(camelot: mix.camelot)
-            }
-            Text(formatTime(Double(song.duration ?? 0)))
-                .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
-                .frame(minWidth: 38, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: false)
         }
+        // Altura fixa: com ou sem linha de artista, o espaçamento entre faixas é sempre o mesmo
+        .frame(height: 44)
         .contentShape(Rectangle())
         .opacity(isPressed ? 0.55 : 1)
         .scaleEffect(isPressed ? 0.985 : 1)
@@ -136,11 +173,11 @@ struct SongRow: View {
             let context = djContextSongs
             let source = djContextSource
             mix.append(ActionMenuItem(title: djLocalLabel, subtitle: "Automix a partir desta faixa", systemImage: "waveform.path.ecg", style: .accent) {
-                player.startDJMix(startingWith: song, in: context, source: source)
+                player.requestDJMix(startingWith: song, in: context, source: source)
             })
         }
         mix.append(ActionMenuItem(title: "Mix DJ com toda a biblioteca", subtitle: "Busca todas as músicas do servidor", systemImage: "dot.radiowaves.left.and.right", style: .accent) {
-            Task { await player.startFullLibraryDJMix(startingWith: song) }
+            player.requestDJMix(startingWith: song, in: nil, source: nil)
         })
 
         let queue: [ActionMenuItem] = [
@@ -148,6 +185,9 @@ struct SongRow: View {
             ActionMenuItem(title: "Adicionar à fila", systemImage: "text.append") { player.addToQueue(song) },
             ActionMenuItem(title: isFav ? "Remover dos favoritos" : "Favoritar", systemImage: isFav ? "heart.slash" : "heart") { favorites.toggle(song) },
             ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: [song]) },
+            ActionMenuItem(title: "Gêneros", subtitle: genreSubtitle, systemImage: "tag") {
+                player.presentGenrePicker(title: song.title, songs: [song])
+            },
         ]
 
         let goTo: [ActionMenuItem] = [
@@ -165,6 +205,7 @@ struct SongRow: View {
 
         var badges: [String] = []
         if let q = song.qualityText { badges.append(q) }
+        badges += GenreTaxonomy.familyLabels(for: [song], limit: 2)
         if let meta = analysisStore.metadata(for: song.id) { badges.append("\(meta.formattedBPM) BPM"); badges.append(meta.camelot) }
 
         player.actionMenu = ActionMenuRequest(
@@ -176,6 +217,11 @@ struct SongRow: View {
             ),
             sections: sections
         )
+    }
+
+    private var genreSubtitle: String {
+        let labels = GenreTaxonomy.familyLabels(for: [song])
+        return labels.isEmpty ? "Sem gênero — escolher para o Automix" : labels.joined(separator: ", ")
     }
 
     private var djLocalLabel: String {

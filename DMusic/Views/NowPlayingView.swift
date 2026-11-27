@@ -212,6 +212,10 @@ struct NowPlayingView: View {
         var tools: [ActionMenuItem] = []
         if let song = player.currentSong {
             tools.append(ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: [song]) })
+            let genreLabels = GenreTaxonomy.familyLabels(for: [song])
+            tools.append(ActionMenuItem(title: "Gêneros", subtitle: genreLabels.isEmpty ? "Sem gênero — escolher para o Automix" : genreLabels.joined(separator: ", "), systemImage: "tag") {
+                player.presentGenrePicker(title: song.title, songs: [song])
+            })
         }
         tools.append(ActionMenuItem(title: "Estúdio de mixagem", subtitle: "EQ, filtros e curvas do Automix", systemImage: "slider.horizontal.3", style: .accent) {
             Task { @MainActor in

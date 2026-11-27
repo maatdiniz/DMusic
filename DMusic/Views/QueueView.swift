@@ -97,6 +97,13 @@ struct QueueView: View {
                 if !player.automixEnabled { player.automixEnabled = true }
             },
         ]
+        if let current = player.currentSong {
+            let genreItems = player.genreFocusItems(for: current) { mode, fams in
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                player.enableAutomixAndReorganizeFromCurrent(focus: mode, families: fams)
+            }
+            items.insert(contentsOf: genreItems, at: 1)
+        }
         if player.automixEnabled {
             items.append(ActionMenuItem(title: "Desativar Modo DJ", systemImage: "power", style: .destructive) {
                 player.automixEnabled = false
@@ -167,25 +174,24 @@ struct QueueView: View {
                 .frame(width: 50, height: 50)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(song.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-
-                HStack(spacing: 6) {
-                    if let mix = analysisStore.metadata(for: song.id) {
-                        QualityBadge(text: "\(mix.formattedBPM) BPM")
-                    }
-                    Text(ArtistParser.displayString(for: song))
-                        .font(.caption)
-                        .foregroundStyle(Color.white.opacity(0.62))
+                HStack(spacing: 5) {
+                    Text(song.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
+                    if song.isExplicit { ExplicitBadge() }
                 }
+
+                Text(ArtistParser.displayString(for: song))
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.62))
+                    .lineLimit(1)
             }
 
             Spacer()
 
             if let mix = analysisStore.metadata(for: song.id) {
+                QualityBadge(text: mix.formattedBPM)
                 CamelotBadge(camelot: mix.camelot)
             }
 
@@ -207,25 +213,25 @@ struct QueueView: View {
                 .frame(width: 46, height: 46)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(song.title)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-
-                HStack(spacing: 6) {
-                    if let mix = analysisStore.metadata(for: song.id) {
-                        QualityBadge(text: "\(mix.formattedBPM) BPM")
-                    }
-                    Text(ArtistParser.displayString(for: song))
-                        .font(.caption)
-                        .foregroundStyle(Color.white.opacity(0.58))
+                HStack(spacing: 5) {
+                    Text(song.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
+                    if song.isExplicit { ExplicitBadge() }
                 }
+
+                Text(ArtistParser.displayString(for: song))
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.58))
+                    .lineLimit(1)
             }
 
             Spacer()
 
+            if song.isHiRes { HiResTag() }
             if let mix = analysisStore.metadata(for: song.id) {
+                QualityBadge(text: mix.formattedBPM)
                 CamelotBadge(camelot: mix.camelot)
             }
             Text(formatTime(Double(song.duration ?? 0)))

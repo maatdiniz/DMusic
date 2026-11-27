@@ -311,6 +311,11 @@ private struct ActionMenuHostModifier: ViewModifier {
                 AddToPlaylistSheet(songs: request.songs)
                     .presentationDragIndicator(.visible)
             }
+            .sheet(item: $player.genrePicker) { request in
+                GenrePickerSheet(request: request)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            }
     }
 }
 

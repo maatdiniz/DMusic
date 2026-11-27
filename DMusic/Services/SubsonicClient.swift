@@ -102,6 +102,10 @@ nonisolated struct SubsonicClient: Sendable {
             .albumList2?.album ?? []
     }
 
+    func genres() async throws -> [GenreInfo] {
+        try await request("getGenres").genres?.genre ?? []
+    }
+
     func artists() async throws -> [Artist] {
         let raw = try await request("getArtists").artists?.index?.flatMap { $0.artist ?? [] } ?? []
         return ArtistParser.normalizeArtistList(raw)

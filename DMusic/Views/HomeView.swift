@@ -5,6 +5,8 @@ struct HomeView: View {
     @Environment(HomeViewModel.self) private var vm
     @Environment(AudioPlayerManager.self) private var player
     @State private var showSettings = false
+    @State private var startingGenre = false
+    @State private var genreNotice: String?
 
     var body: some View {
         @Bindable var player = player
@@ -31,6 +33,7 @@ struct HomeView: View {
                     if let e = vm.errorMessage {
                         Text(e).foregroundStyle(.red).padding(.horizontal, 16)
                     }
+                    genreEntry
                     carousel("Adicionados recentemente", vm.newest)
                     carousel("Tocados recentemente", vm.recent)
                     carousel("Descubra", vm.random)
@@ -41,6 +44,9 @@ struct HomeView: View {
             .toolbar(.hidden, for: .navigationBar)
             .playerBottomSpace()
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .alert("Pool ampliado", isPresented: Binding(get: { genreNotice != nil }, set: { if !$0 { genreNotice = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(genreNotice ?? "") }
             .navigationDestination(for: Album.self) { AlbumDetailView(albumId: $0.id, fallback: $0) }
             .navigationDestination(for: Artist.self) { ArtistDetailView(artistId: $0.id, name: $0.name) }
             .navigationDestination(for: Playlist.self) { PlaylistDetailView(playlist: $0) }
@@ -48,6 +54,51 @@ struct HomeView: View {
             .task { if let c = auth.client { await vm.load(client: c) } }
         }
         .miniPlayerInset()
+    }
+
+    @ViewBuilder
+    private var genreEntry: some View {
+        if !vm.genres.isEmpty {
+            let counts = GenreLibrary.familyCounts(vm.genres)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Mixes por gênero")
+                    .font(.title3.bold())
+                    .padding(.horizontal, 16)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 12) {
+                        ForEach(counts.prefix(6), id: \.family) { item in
+                            NavigationLink {
+                                GenreInventoryView(genres: vm.genres, library: vm.genreLibrary, only: item.family)
+                            } label: {
+                                GenreCoverTile(family: item.family, count: item.count,
+                                               onPlay: { startGenre(item.family, automix: false) },
+                                               onAutomix: { startGenre(item.family, automix: true) })
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        NavigationLink {
+                            GenreCoversView(genres: vm.genres, library: vm.genreLibrary,
+                                            onStart: { startGenre($0, automix: $1) })
+                        } label: {
+                            GenreAllCoverTile()
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 16)
+                }
+            }
+            .overlay { if startingGenre { ProgressView().controlSize(.large) } }
+        }
+    }
+
+    private func startGenre(_ family: GenreFamily, automix: Bool) {
+        guard let client = auth.client, !startingGenre else { return }
+        Task {
+            startingGenre = true
+            defer { startingGenre = false }
+            genreNotice = await vm.genreLibrary.startMix(title: family.rawValue, family: family, automix: automix,
+                                                         client: client, player: player)
+        }
     }
 
     @ViewBuilder

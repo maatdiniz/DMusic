@@ -7,6 +7,8 @@ final class HomeViewModel {
     var newest: [Album] = []
     var recent: [Album] = []
     var random: [Album] = []
+    var genres: [GenreInfo] = []
+    let genreLibrary = GenreLibrary()
     var isLoading = false
     var errorMessage: String?
     private(set) var hasLoadedOnce = false
@@ -36,6 +38,7 @@ final class HomeViewModel {
                 async let r = client.albumList(type: "recent")
                 async let x = client.albumList(type: "random")
                 (newest, recent, random) = try await (n, r, x)
+                genres = (try? await client.genres()) ?? genres
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -50,6 +53,7 @@ final class HomeViewModel {
         newest = []
         recent = []
         random = []
+        genres = []
         isLoading = false
         errorMessage = nil
         hasLoadedOnce = false

@@ -11,6 +11,50 @@ nonisolated enum SmartShuffler {
         let energy: Double // 0.0 a 1.0
         let vibe: [Float]? // Vetor 24D Z-score L2 (timbre, bandas, harmonia/percussão, groove)
         let genre: String? // Gênero normalizado (Navidrome) para desempate sutil
+        // Foco de gênero: famílias da faixa (já com os ajustes do usuário) e as da faixa âncora do mix
+        var families: Set<GenreFamily> = []
+        var anchorFamilies: Set<GenreFamily> = []
+        var genreWeight: Double = 0 // 0 = variar entre gêneros; 1 = priorizar a família da âncora
+    }
+
+    /// Como a fila deve tratar gênero ao começar um Mix DJ a partir de uma faixa.
+    enum MixFocus: String, Sendable, CaseIterable {
+        case variety      // só som (BPM, tom, vibe, energia): comportamento antigo
+        case genre        // prioriza o(s) gênero(s) da faixa inicial, mas deixa vizinhos entrarem
+        case strictGenre  // só faixas do(s) gênero(s) da faixa inicial (ampliando com vizinhos se faltar)
+    }
+
+    struct GenreFocus: Sendable {
+        var weight: Double
+        var anchorFamilies: Set<GenreFamily>
+        static let none = GenreFocus(weight: 0, anchorFamilies: [])
+
+        /// `families` escolhe explicitamente quais famílias focar; sem ele vale o conjunto de gêneros da âncora.
+        static func make(anchor: Song?, mode: MixFocus, families: Set<GenreFamily>? = nil) -> GenreFocus {
+            guard mode != .variety else { return .none }
+            let base = families ?? anchor.map { Set(GenreTaxonomy.tags(for: $0).map(\.family)) } ?? []
+            let fams = base.subtracting([.other])
+            return fams.isEmpty ? .none : GenreFocus(weight: 1, anchorFamilies: fams)
+        }
+    }
+
+    /// 1 = mesma família; 0,4 = famílias vizinhas; 0 = sem relação; 0,35 = gênero desconhecido (neutro).
+    static func genreAffinity(_ x: Set<GenreFamily>, _ y: Set<GenreFamily>) -> Double {
+        let x = x.subtracting([.other]), y = y.subtracting([.other])
+        if x.isEmpty || y.isEmpty { return 0.35 }
+        if !x.isDisjoint(with: y) { return 1 }
+        for f in x where f.neighbors.contains(where: { y.contains($0) }) { return 0.4 }
+        return 0
+    }
+
+    /// Ajuste de pontos pelo foco de gênero: de +12 (mesma família) a −22 (sem relação). Peso 0 não muda nada.
+    static func genreAdjustment(from a: TrackMeta, to b: TrackMeta) -> Double {
+        let w = b.genreWeight
+        guard w > 0 else { return 0 }
+        let pair = genreAffinity(a.families, b.families)
+        let anchor = b.anchorFamilies.isEmpty ? pair : genreAffinity(b.anchorFamilies, b.families)
+        let aff = 0.6 * pair + 0.4 * anchor
+        return w * (34.0 * aff - 22.0)
     }
 
     /// Normaliza o título para detectar duplicatas/versões da mesma música
@@ -146,7 +190,7 @@ nonisolated enum SmartShuffler {
                 vibePts -= 30.0 * clash
             }
             let genreBonus = sameGenre ? 4.0 : 0.0
-            let total = min(100.0, max(0.0, bpmPts + camPts + engPts + vibePts + genreBonus))
+            let total = min(100.0, max(0.0, bpmPts + camPts + engPts + vibePts + genreBonus + genreAdjustment(from: a, to: b)))
             return ScoreBreakdown(
                 bpmPoints: bpmPts,
                 camelotPoints: camPts,
@@ -161,7 +205,7 @@ nonisolated enum SmartShuffler {
             let camPts = camelotScore(keyA: a.camelot, keyB: b.camelot)
             let engPts = energyScore(energyA: a.energy, energyB: b.energy)
             let genreBonus = sameGenre ? 5.0 : 0.0
-            let total = min(75.0, (bpmPts + camPts + engPts + genreBonus) * 0.75)
+            let total = min(75.0, max(0.0, (bpmPts + camPts + engPts + genreBonus) * 0.75 + genreAdjustment(from: a, to: b) * 0.75))
             return ScoreBreakdown(
                 bpmPoints: bpmPts,
                 camelotPoints: camPts,
@@ -238,7 +282,8 @@ nonisolated enum SmartShuffler {
         return clean.isEmpty ? nil : clean
     }
 
-    private static func toTrackMeta(_ meta: TrackMixMetadata, title: String = "", artist: String? = nil, genre: String? = nil) -> TrackMeta? {
+    private static func toTrackMeta(_ meta: TrackMixMetadata, title: String = "", artist: String? = nil, genre: String? = nil,
+                                    families: Set<GenreFamily> = [], focus: GenreFocus = .none) -> TrackMeta? {
         guard let cam = CamelotKey(code: meta.camelot) else { return nil }
         return TrackMeta(
             id: meta.songId,
@@ -247,7 +292,10 @@ nonisolated enum SmartShuffler {
             camelot: cam,
             energy: meta.energy ?? 0.5,
             vibe: meta.vibe,
-            genre: normalizedGenre(genre)
+            genre: normalizedGenre(genre),
+            families: families,
+            anchorFamilies: focus.anchorFamilies,
+            genreWeight: focus.weight
         )
     }
 
@@ -318,7 +366,8 @@ nonisolated enum SmartShuffler {
         startingWith anchor: Song? = nil,
         maxAttempts: Int = 6,
         maxDurationSec: TimeInterval = 0.28,
-        topK: Int = 3
+        topK: Int = 3,
+        genreFocus: GenreFocus = .none
     ) -> [Song] {
         guard songs.count > 1 else { return songs }
 
@@ -333,7 +382,9 @@ nonisolated enum SmartShuffler {
         var localEntries: [(song: Song, meta: TrackMeta)] = []
         var unanalyzedSongs: [Song] = []
         for s in uniqueSongs {
-            if let raw = metadata[s.id], let tm = toTrackMeta(raw, title: s.title, artist: s.artist, genre: s.genre) {
+            if let raw = metadata[s.id], let tm = toTrackMeta(raw, title: s.title, artist: s.artist, genre: s.genre,
+                                                         families: genreFocus.weight > 0 ? Set(GenreTaxonomy.tags(for: s).map(\.family)) : [],
+                                                         focus: genreFocus) {
                 if raw.analyzer == "allin1" {
                     serverEntries.append((s, tm))
                 } else {

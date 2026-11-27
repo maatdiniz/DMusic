@@ -44,6 +44,15 @@ final class AudioPlayerManager {
     var searchFocusTrigger: Int = 0
     var visibleDetailId: String?
 
+    /// Toca junto com o áudio de outros apps (vídeo, podcast, outro player) em vez de pausar ou ser pausado.
+    /// Usa a opção `.mixWithOthers` da sessão de áudio; quem decide o volume de cada um é o usuário.
+    var mixWithOtherApps: Bool {
+        didSet {
+            UserDefaults.standard.set(mixWithOtherApps, forKey: "mix_with_other_apps")
+            configureSession()
+        }
+    }
+
     /// Automix automático (sincroniza BPM com rampa na Faixa A antes da entrada,
     /// dispara Faixa B no downbeat via AVAudioEngine + Bass Swap e usa SmartShuffler).
     var automixEnabled: Bool {
@@ -93,6 +102,16 @@ final class AudioPlayerManager {
     /// Seletor de playlist, aberto depois que o menu fecha.
     var playlistPicker: PlaylistPickerRequest?
 
+    /// Seletor de gêneros (música ou álbum), aberto depois que o menu fecha.
+    var genrePicker: GenrePickerRequest?
+
+    func presentGenrePicker(title: String, songs: [Song], albumId: String? = nil) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(380))
+            self?.genrePicker = GenrePickerRequest(title: title, songs: songs, albumId: albumId)
+        }
+    }
+
     /// Abre o seletor de playlist com uma pequena espera, para não colidir com o painel de menu que está fechando.
     func presentPlaylistPicker(for songs: [Song]) {
         Task { @MainActor [weak self] in
@@ -134,9 +153,10 @@ final class AudioPlayerManager {
     nonisolated private static func smartOrder(
         songs: [Song],
         metadata: [String: TrackMixMetadata],
-        anchor: Song?
+        anchor: Song?,
+        focus: SmartShuffler.GenreFocus = .none
     ) -> (queue: [Song], report: SmartShuffleRunLog) {
-        let ordered = SmartShuffler.smartShuffle(songs: songs, metadata: metadata, startingWith: anchor)
+        let ordered = SmartShuffler.smartShuffle(songs: songs, metadata: metadata, startingWith: anchor, genreFocus: focus)
         return (ordered, SmartShuffler.buildShuffleReport(orderedSongs: ordered, metadata: metadata))
     }
 
@@ -255,6 +275,9 @@ final class AudioPlayerManager {
     @ObservationIgnored var scrobbler: ScrobbleManager?
     @ObservationIgnored var settings: CacheSettings?
     @ObservationIgnored var analysisStore: TrackAnalysisStore?
+    @ObservationIgnored var transitionAudit: TransitionAuditStore?
+    @ObservationIgnored private var preparedPairContext: (from: Song, to: Song, appliedOverride: Bool)?
+    @ObservationIgnored private var auditionTask: Task<Void, Never>?
     @ObservationIgnored private var restored = false
     @ObservationIgnored private var sleepTask: Task<Void, Never>?
     /// Sleep timer: horário em que a música vai pausar (nil = desligado).
@@ -302,6 +325,7 @@ final class AudioPlayerManager {
     private(set) var priorityCount = 0
 
     init() {
+        mixWithOtherApps = UserDefaults.standard.object(forKey: "mix_with_other_apps") as? Bool ?? false
         automixEnabled = UserDefaults.standard.object(forKey: "automix_enabled") as? Bool ?? false
         let rawDur = UserDefaults.standard.integer(forKey: "automix_duration_choice")
         automixDurationChoice = AutomixDurationChoice(rawValue: rawDur) ?? .auto
@@ -445,6 +469,17 @@ final class AudioPlayerManager {
                         "Mixando (\(p.mix.bars ?? 8) compassos • \(badge.text))",
                         detail: "Saída \(Self.formatMMSS(p.trackA.mixStartSec)) (\(p.trackA.section ?? "inst")) → Entrada \(Self.formatMMSS(p.trackB.entrySec)) (\(p.trackB.section ?? "drop")) | Vol: \(vol) | EQ: \(eq) | Filtro: \(flt)"
                     )
+                    if let ctx = self.preparedPairContext,
+                       ctx.from.id == p.trackA.id,
+                       ctx.to.id == p.trackB.id {
+                        self.transitionAudit?.recordTransition(
+                            from: ctx.from,
+                            to: ctx.to,
+                            plan: p,
+                            appliedOverride: ctx.appliedOverride
+                        )
+                        self.preparedPairContext = nil
+                    }
                 }
             }
         }
@@ -478,6 +513,11 @@ final class AudioPlayerManager {
             guard let idx = resolvedIdx else { return }
 
             self.stageSettleSafetyTask?.cancel()
+            if let prev = previousSong,
+               (self.preparedPairContext?.from.id != prev.id || self.preparedPairContext?.to.id != self.queue[idx].id) {
+                let hadOverride = self.transitionAudit?.override(from: prev.id, to: self.queue[idx].id)?.hasParameterCustomizations ?? false
+                self.preparedPairContext = (from: prev, to: self.queue[idx], appliedOverride: hadOverride)
+            }
             if self.coverStageMode != .ramping {
                 self.stageCoverArtA = previousSong?.coverArt
                 self.stageCoverArtB = self.queue[idx].coverArt
@@ -604,9 +644,10 @@ final class AudioPlayerManager {
     // MARK: Session
 
     private func configureSession() {
+        let options: AVAudioSession.CategoryOptions = mixWithOtherApps ? [.mixWithOthers] : []
         Task.detached(priority: .userInitiated) {
             let s = AVAudioSession.sharedInstance()
-            try? s.setCategory(.playback, mode: .default)
+            try? s.setCategory(.playback, mode: .default, options: options)
         }
     }
 
@@ -681,10 +722,16 @@ final class AudioPlayerManager {
     }
 
     /// Reativa o Modo DJ e reorganiza a fila inteira a partir da música que está tocando agora (sem interromper o áudio).
-    func enableAutomixAndReorganizeFromCurrent() {
+    /// `focus`/`families` mudam o foco de gênero da sessão antes de reordenar; sem eles, o foco atual é mantido.
+    /// No modo "só gênero" a fila restante fica apenas com as famílias escolhidas (a fila original não é perdida).
+    func enableAutomixAndReorganizeFromCurrent(focus: SmartShuffler.MixFocus? = nil, families: Set<GenreFamily>? = nil) {
         shuffle = true
         if !automixEnabled { automixEnabled = true }
         guard let current = currentSong else { return }
+        if let focus {
+            MixFocusPreference.record(focus)
+            activeGenreFocus = SmartShuffler.GenreFocus.make(anchor: current, mode: focus, families: families)
+        }
 
         let priorityStart = currentIndex + 1
         let priorityEnd = min(queue.count, priorityStart + priorityCount)
@@ -694,7 +741,10 @@ final class AudioPlayerManager {
         let poolSource = originalQueue.count >= queue.count ? originalQueue : queue
         var seen: Set<String> = [current.id]
         seen.formUnion(priorityIds)
-        let remaining = poolSource.filter { seen.insert($0.id).inserted }
+        var remaining = poolSource.filter { seen.insert($0.id).inserted }
+        if focus == .strictGenre {
+            remaining = filterForStrictGenre(remaining, families: activeGenreFocus.anchorFamilies, keeping: nil)
+        }
         guard !remaining.isEmpty else {
             syncMetadataAndRefreshShuffleIfNeeded(source: playbackSource, originalCount: originalQueue.count)
             return
@@ -702,6 +752,7 @@ final class AudioPlayerManager {
 
         let anchor = prioritySongs.last ?? current
         let metadata = analysisStore?.items
+        let gf = activeGenreFocus
         let token = beginBusy("Reorganizando a fila do Mix DJ")
         reorderTask?.cancel()
         reorderTask = Task { [weak self] in
@@ -709,7 +760,7 @@ final class AudioPlayerManager {
             var report: SmartShuffleRunLog?
             if let metadata {
                 let result = await Task.detached(priority: .userInitiated) {
-                    Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor)
+                    Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor, focus: gf)
                 }.value
                 smartTail = Array(result.queue.dropFirst())
                 report = result.report
@@ -731,16 +782,19 @@ final class AudioPlayerManager {
     func play(songs: [Song], startAt index: Int = 0, source: PlaybackSource? = nil) {
         guard !songs.isEmpty, songs.indices.contains(index) else { return }
         queueBuildTask?.cancel()
+        activeGenreFocus = pendingGenreFocus
+        pendingGenreFocus = .none
         let chosen = songs[index]
 
         // Mix DJ: o Smart Shuffle (centenas de faixas, vários candidatos) roda fora da thread principal;
         // a interface continua responsiva e mostra o indicador de carregamento.
         if shuffle, automixEnabled, let store = analysisStore {
             let metadata = store.items
+            let gf = activeGenreFocus
             let token = beginBusy("Montando a fila do Mix DJ")
             queueBuildTask = Task { [weak self] in
                 let result = await Task.detached(priority: .userInitiated) {
-                    Self.smartOrder(songs: songs, metadata: metadata, anchor: chosen)
+                    Self.smartOrder(songs: songs, metadata: metadata, anchor: chosen, focus: gf)
                 }.value
                 guard let self else { return }
                 self.endBusy(token)
@@ -776,14 +830,17 @@ final class AudioPlayerManager {
     func playAll(_ songs: [Song], shuffled: Bool = false, source: PlaybackSource? = nil) {
         guard !songs.isEmpty else { return }
         queueBuildTask?.cancel()
+        activeGenreFocus = pendingGenreFocus
+        pendingGenreFocus = .none
         shuffle = shuffled
 
         if shuffled, automixEnabled, let store = analysisStore {
             let metadata = store.items
+            let gf = activeGenreFocus
             let token = beginBusy("Montando a fila do Mix DJ")
             queueBuildTask = Task { [weak self] in
                 let result = await Task.detached(priority: .userInitiated) {
-                    Self.smartOrder(songs: songs, metadata: metadata, anchor: nil)
+                    Self.smartOrder(songs: songs, metadata: metadata, anchor: nil, focus: gf)
                 }.value
                 guard let self else { return }
                 self.endBusy(token)
@@ -809,19 +866,130 @@ final class AudioPlayerManager {
         }
     }
 
+    /// Foco de gênero do Mix DJ em andamento (famílias da faixa inicial). Reaplicado em toda reorganização da fila.
+    @ObservationIgnored private(set) var activeGenreFocus: SmartShuffler.GenreFocus = .none
+    /// Foco escolhido para o próximo `play`; consumido (e zerado) por ele.
+    @ObservationIgnored private var pendingGenreFocus: SmartShuffler.GenreFocus = .none
+
+    /// Toca um pool de gênero em ordem aleatória. Com `automix` o Smart Shuffle ordena para mixar e o motor
+    /// dual-deck faz as transições; sem ele, reprodução gapless embaralhada.
+    func playGenreMix(title: String, songs: [Song], automix: Bool) {
+        guard !songs.isEmpty else { return }
+        shuffle = true
+        if automixEnabled != automix { automixEnabled = automix }
+        play(songs: songs.shuffled(), startAt: 0, source: .djMix(seedTitle: title))
+    }
+
+    // MARK: Mix DJ a partir de uma faixa: foco de gênero
+
+    /// Famílias de gênero de uma faixa, na ordem fixa do catálogo (sem "Outros").
+    func genreFamilies(of song: Song) -> [GenreFamily] {
+        let set = Set(GenreTaxonomy.tags(for: song).map(\.family)).subtracting([.other])
+        return GenreFamily.allCases.filter { set.contains($0) }
+    }
+
+    /// Opções de foco de gênero para uma faixa de referência. Cada gênero da faixa pode ser escolhido sozinho
+    /// ou em conjunto. `launch(modo, famílias)` roda a ação (iniciar um mix ou reordenar a fila).
+    /// A escolha mais frequente do usuário vem marcada como sugestão.
+    func genreFocusItems(for song: Song, launch: @escaping (SmartShuffler.MixFocus, Set<GenreFamily>?) -> Void) -> [ActionMenuItem] {
+        let fams = genreFamilies(of: song)
+        let preferred = MixFocusPreference.preferred
+
+        func options(_ mode: SmartShuffler.MixFocus, verb: String, icon: String) -> [ActionMenuItem] {
+            var list: [ActionMenuItem] = []
+            if fams.count > 1 {
+                list.append(ActionMenuItem(title: fams.map(\.rawValue).joined(separator: " + "), subtitle: "Todos os gêneros da faixa",
+                                           systemImage: icon, style: .accent) { launch(mode, Set(fams)) })
+            }
+            for f in fams {
+                list.append(ActionMenuItem(title: f.rawValue, systemImage: icon) { launch(mode, [f]) })
+            }
+            return list
+        }
+
+        var items: [ActionMenuItem] = []
+        if !fams.isEmpty {
+            let label = fams.map(\.rawValue).joined(separator: ", ")
+            let focus = options(.genre, verb: "Focar", icon: "scope")
+            let only = options(.strictGenre, verb: "Só", icon: "line.3.horizontal.decrease.circle")
+            items.append(focus.count == 1
+                ? ActionMenuItem(title: "Focar em \(label)", subtitle: "Prioriza o gênero; vizinhos entram só quando faltar",
+                                 systemImage: "scope", style: .accent, isSelected: preferred == .genre, children: nil) { launch(.genre, Set(fams)) }
+                : ActionMenuItem(title: "Focar em…", subtitle: "Prioriza o gênero escolhido; vizinhos entram só quando faltar",
+                                 systemImage: "scope", style: .accent, isSelected: preferred == .genre, children: focus))
+            items.append(only.count == 1
+                ? ActionMenuItem(title: "Só \(label)", subtitle: "Deixa o resto da biblioteca de fora",
+                                 systemImage: "line.3.horizontal.decrease.circle", isSelected: preferred == .strictGenre, children: nil) { launch(.strictGenre, Set(fams)) }
+                : ActionMenuItem(title: "Só…", subtitle: "Deixa o resto da biblioteca de fora",
+                                 systemImage: "line.3.horizontal.decrease.circle", isSelected: preferred == .strictGenre, children: only))
+        }
+        items.append(ActionMenuItem(title: "Variar entre gêneros", subtitle: "Só BPM, tom, vibe e energia",
+                                    systemImage: "shuffle", isSelected: preferred == .variety) { launch(.variety, nil) })
+        return items
+    }
+
+    /// Pergunta como montar a fila (focar num gênero da faixa, só ele, ou variar) e inicia o Mix DJ.
+    /// `context == nil` usa a biblioteca inteira do servidor. Faixas sem gênero vão direto para "variar".
+    func requestDJMix(startingWith song: Song, in context: [Song]?, source: PlaybackSource?) {
+        let fams = genreFamilies(of: song)
+        func launch(_ mode: SmartShuffler.MixFocus, _ chosen: Set<GenreFamily>?) {
+            MixFocusPreference.record(mode)
+            if let context {
+                startDJMix(startingWith: song, in: context, source: source, focus: mode, families: chosen)
+            } else {
+                Task { await startFullLibraryDJMix(startingWith: song, focus: mode, families: chosen) }
+            }
+        }
+        guard !fams.isEmpty else { launch(.variety, nil); return }
+
+        let request = ActionMenuRequest(
+            header: ActionMenuHeader(title: song.title, subtitle: "Gênero: \(fams.map(\.rawValue).joined(separator: ", "))", coverArt: song.coverArt),
+            title: nil,
+            message: "Como montar a fila a partir desta faixa?",
+            sections: [genreFocusItems(for: song, launch: launch)]
+        )
+        // Espera o menu de origem terminar de fechar para os painéis não se atropelarem
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(380))
+            self?.actionMenu = request
+        }
+    }
+
+    /// Mantém só faixas das famílias escolhidas; se sobrarem poucas, soma famílias vizinhas.
+    private func filterForStrictGenre(_ songs: [Song], families fams: Set<GenreFamily>, keeping anchorId: String?) -> [Song] {
+        let fams = fams.subtracting([.other])
+        guard !fams.isEmpty else { return songs }
+        func shares(_ s: Song, _ target: Set<GenreFamily>) -> Bool {
+            !Set(GenreTaxonomy.tags(for: s).map(\.family)).isDisjoint(with: target)
+        }
+        var out = songs.filter { $0.id == anchorId || shares($0, fams) }
+        if out.count < GenreLibrary.minimumPool {
+            let near = Set(fams.flatMap(\.neighbors)).subtracting(fams)
+            let have = Set(out.map(\.id))
+            let extra = songs.filter { !have.contains($0.id) && shares($0, near) }
+            out += extra
+            logEvent("SHUFFLE", "Só gênero: poucas faixas, ampliado com vizinhos", detail: "Foco: \(fams.map(\.rawValue).joined(separator: ", ")) • +\(extra.count) vizinhas")
+        }
+        return out
+    }
+
     /// Inicia imediatamente um Mix DJ (Automix + Smart Shuffle) a partir de `song` usando a lista local (`contextSongs`).
-    func startDJMix(startingWith song: Song, in contextSongs: [Song], source: PlaybackSource?) {
-        let pool = contextSongs.isEmpty ? [song] : contextSongs
+    func startDJMix(startingWith song: Song, in contextSongs: [Song], source: PlaybackSource?,
+                    focus: SmartShuffler.MixFocus = .variety, families: Set<GenreFamily>? = nil) {
+        var pool = contextSongs.isEmpty ? [song] : contextSongs
+        let chosenFamilies = families ?? Set(genreFamilies(of: song))
+        if focus == .strictGenre { pool = filterForStrictGenre(pool, families: chosenFamilies, keeping: song.id) }
         let idx = pool.firstIndex(where: { $0.id == song.id }) ?? 0
         shuffle = true
         if !automixEnabled { automixEnabled = true }
+        pendingGenreFocus = SmartShuffler.GenreFocus.make(anchor: song, mode: focus, families: families)
         play(songs: pool, startAt: idx, source: .djMix(seedTitle: song.title))
     }
 
     /// Inicia um Mix DJ (Automix + Smart Shuffle) a partir de `song` usando TODAS as músicas da biblioteca do servidor.
-    func startFullLibraryDJMix(startingWith song: Song) async {
+    func startFullLibraryDJMix(startingWith song: Song, focus: SmartShuffler.MixFocus = .variety, families: Set<GenreFamily>? = nil) async {
         guard let client else {
-            startDJMix(startingWith: song, in: [song], source: .djMix(seedTitle: song.title))
+            startDJMix(startingWith: song, in: [song], source: .djMix(seedTitle: song.title), focus: focus, families: families)
             return
         }
         let token = beginBusy("Buscando a biblioteca completa")
@@ -848,9 +1016,13 @@ final class AudioPlayerManager {
         } else if !knownIds.contains(song.id) {
             allSongs.insert(song, at: 0)
         }
+        if focus == .strictGenre {
+            allSongs = filterForStrictGenre(allSongs, families: families ?? Set(genreFamilies(of: song)), keeping: song.id)
+        }
         let idx = allSongs.firstIndex(where: { $0.id == song.id }) ?? 0
         shuffle = true
         if !automixEnabled { automixEnabled = true }
+        pendingGenreFocus = SmartShuffler.GenreFocus.make(anchor: song, mode: focus, families: families)
         play(songs: allSongs, startAt: idx, source: .djMix(seedTitle: song.title))
     }
 
@@ -1083,6 +1255,53 @@ final class AudioPlayerManager {
         }
     }
 
+    /// Re-arma o plano imediatamente se o usuário acabou de salvar/remover uma receita para o par atual.
+    func reprepareCurrentPairIfMatching(from idA: String, to idB: String) {
+        guard currentSong?.id == idA, nextSongInQueue?.id == idB else { return }
+        reprepareIncomingIfNeeded()
+    }
+
+    /// Reproduz o par `(songA → songB)` em modo DJ e posiciona alguns segundos antes do ponto de mixagem
+    /// para o usuário auditar a transição imediatamente com a receita configurada.
+    func auditionTransition(from songA: Song, to songB: Song) {
+        auditionTask?.cancel()
+        queueBuildTask?.cancel()
+        shuffle = false
+        if !automixEnabled { automixEnabled = true }
+        playbackSource = .djMix(seedTitle: "Auditoria")
+        originalQueue = [songA, songB]
+        priorityCount = 0
+        queue = [songA, songB]
+        load(index: 0, autoplay: true)
+
+        auditionTask = Task { [weak self] in
+            guard let self else { return }
+            // Aguarda o motor armar o plano de transição (incluindo receita personalizada)
+            for _ in 0..<60 {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                if let plan = self.activeTransitionPlan,
+                   plan.trackA.id == songA.id,
+                   plan.trackB.id == songB.id,
+                   self.usingEngineMode {
+                    let leadBeforeMix = max(0.0, plan.trackA.mixStartSec - 8.0)
+                    let targetSec: Double
+                    if abs(plan.sync.targetRateA - 1.0) >= 0.003,
+                       plan.trackA.rampStartSec < plan.trackA.mixStartSec,
+                       plan.trackA.mixStartSec - plan.trackA.rampStartSec <= 14.0 {
+                        targetSec = max(0.0, plan.trackA.rampStartSec - 1.5)
+                    } else {
+                        targetSec = leadBeforeMix
+                    }
+                    if targetSec > 1.0 {
+                        self.seek(to: targetSec)
+                    }
+                    return
+                }
+            }
+        }
+    }
+
     private func reprepareIncomingIfNeeded() {
         guard shouldUseAutomix, usingEngineMode, !isAutomixing,
               let song = currentSong, let nextSong = nextSongInQueue else { return }
@@ -1092,26 +1311,41 @@ final class AudioPlayerManager {
         }
     }
 
-    private func applyUserAutomixOverrides(to rawPlan: TransitionPlan) -> TransitionPlan {
+    private func applyUserAutomixOverrides(
+        to rawPlan: TransitionPlan,
+        pairOverride: TransitionOverride? = nil,
+        durationA: Double? = nil,
+        durationB: Double? = nil
+    ) -> TransitionPlan {
         var plan = rawPlan
 
-        // No modo "auto" o app executa exatamente o que o servidor decidiu (curva, EQ, filtro e pontos de mix);
-        // só as escolhas explícitas do usuário nos ajustes substituem o plano.
-        if automixVolumeCurve != .auto {
-            plan.mix.volumeCurve = automixVolumeCurve.rawValue
+        // Prioridade: Receita personalizada do par (A → B) > Ajuste global do usuário > Sugestão automática do servidor/local.
+        let effectiveVolumeCurve: AutomixVolumeCurve = {
+            if let pairOverride, pairOverride.volumeCurve != .auto { return pairOverride.volumeCurve }
+            return automixVolumeCurve
+        }()
+        if effectiveVolumeCurve != .auto {
+            plan.mix.volumeCurve = effectiveVolumeCurve.rawValue
         } else if (plan.mix.volumeCurve ?? "").isEmpty {
             plan.mix.volumeCurve = AutomixVolumeCurve.overlap.rawValue
         }
 
-        if automixEQStyle != .auto {
-            plan.mix.eqStyle = automixEQStyle.rawValue
+        let effectiveEQStyle: AutomixEQStyle = {
+            if let pairOverride, pairOverride.eqStyle != .auto { return pairOverride.eqStyle }
+            return automixEQStyle
+        }()
+        if effectiveEQStyle != .auto {
+            plan.mix.eqStyle = effectiveEQStyle.rawValue
         } else if (plan.mix.eqStyle ?? "").isEmpty {
             plan.mix.eqStyle = AutomixEQStyle.centerBassSwap.rawValue
         }
 
-        // Filtro Passa-Alta / Passa-Baixa: por padrão ("auto") usa o sugerido pelo servidor ou "hp_in_hp_out"
-        if automixFilterStyle != .auto {
-            plan.mix.filterStyle = automixFilterStyle.rawValue
+        let effectiveFilterStyle: AutomixFilterStyle = {
+            if let pairOverride, pairOverride.filterStyle != .auto { return pairOverride.filterStyle }
+            return automixFilterStyle
+        }()
+        if effectiveFilterStyle != .auto {
+            plan.mix.filterStyle = effectiveFilterStyle.rawValue
         } else if (plan.mix.filterStyle ?? "").isEmpty {
             plan.mix.filterStyle = AutomixFilterStyle.hpInHpOut.rawValue
         }
@@ -1121,39 +1355,60 @@ final class AudioPlayerManager {
             plan.mix.eqSwap.bassCutDb = -24.0
         }
 
-        // Reverb opcional
-        if automixReverbEnabled {
+        // Reverb opcional (receita do par pode forçar ligado ou desligado)
+        if let pairOverride, pairOverride.reverbChoice != .auto {
+            plan.mix.reverbTail = (pairOverride.reverbChoice == .on)
+        } else if automixReverbEnabled {
             plan.mix.reverbTail = true
         }
 
-        // Duração da mix em compassos INTEIROS de A, com o início preso na âncora de frase (`mixStartSec` vem do downbeat
-        // de uma seção do allin1 ou da grade de frases local). Assim a entrada cai no tempo 1 e o fim da mix também.
-        // Se não couber até o fim da faixa, reduz os compassos (16 → 8 → 4 → 2) em vez de tirar o início da frase;
-        // só recua o início (em compassos inteiros) quando nem 2 compassos cabem.
-        // Planos do servidor já vêm em compassos inteiros da grade constante (e com `bars` do usuário aplicado no
-        // próprio servidor via `barsOverride`): só o plano local (offline) precisa deste ajuste.
-        let userFixedBars = automixDurationChoice != .auto
-        if plan.source != "allin1" && (plan.transitionType == "beatmatch" || userFixedBars) {
-            let bpmA = max(plan.trackA.bpm, 65.0)
-            let rateA = Double(max(plan.sync.targetRateA, 0.75))
-            let barSecA = 4.0 * 60.0 / bpmA
-            let durA = duration > 0 ? duration : max(plan.trackA.mixEndSec + 10.0, 120.0)
-            let maxEnd = durA - 0.25
-            let currentSpan = plan.trackA.mixEndSec - plan.trackA.mixStartSec
+        let bpmA = max(plan.trackA.bpm, 65.0)
+        let bpmB = max(plan.trackB.bpm, 65.0)
+        let rateA = Double(max(plan.sync.targetRateA, 0.75))
+        let barSecA = 4.0 * 60.0 / bpmA
+        let barSecB = 4.0 * 60.0 / bpmB
+        let durA = (durationA ?? 0) > 0 ? (durationA ?? 0) : (duration > 0 ? duration : max(plan.trackA.mixEndSec + 10.0, 120.0))
+        let maxEnd = max(4.0, durA - 0.25)
+
+        // Deslocamento personalizado do ponto de entrada de B em compassos inteiros
+        if let pairOverride, pairOverride.entryOffsetBars != 0 {
+            let shiftedEntry = plan.trackB.entrySec + Double(pairOverride.entryOffsetBars) * barSecB
+            let maxEntryB: Double
+            if let durB = durationB, durB > 12.0 {
+                maxEntryB = durB - 8.0
+            } else {
+                maxEntryB = max(shiftedEntry, 0.0)
+            }
+            plan.trackB.entrySec = min(max(0.0, shiftedEntry), maxEntryB)
+        }
+
+        // Deslocamento personalizado do ponto de saída de A em compassos inteiros
+        let pairStartOffsetBars = pairOverride?.mixStartOffsetBars ?? 0
+        let pairDurationChoice = pairOverride?.durationChoice ?? .auto
+        let effectiveDurationChoice = pairDurationChoice != .auto ? pairDurationChoice : automixDurationChoice
+        let userFixedBars = effectiveDurationChoice != .auto
+        let needsTimingRecalc = (pairStartOffsetBars != 0)
+            || (pairDurationChoice != .auto)
+            || (plan.source != "allin1" && (plan.transitionType == "beatmatch" || userFixedBars))
+
+        if needsTimingRecalc {
+            let currentSpan = max(barSecA * 2.0, plan.trackA.mixEndSec - plan.trackA.mixStartSec)
             let requestedBars = userFixedBars
-                ? automixDurationChoice.rawValue
+                ? effectiveDurationChoice.rawValue
                 : (plan.mix.bars ?? max(2, Int((currentSpan / barSecA).rounded())))
 
+            var newStart = plan.trackA.mixStartSec + Double(pairStartOffsetBars) * barSecA
+            newStart = max(0.0, min(newStart, max(0.0, maxEnd - 2.0 * barSecA)))
+
             var bars = max(requestedBars, 2)
-            while bars > 2 && plan.trackA.mixStartSec + Double(bars) * barSecA > maxEnd {
+            while bars > 2 && newStart + Double(bars) * barSecA > maxEnd {
                 bars = max(bars / 2, 2)
             }
-            var newStart = plan.trackA.mixStartSec
             if newStart + Double(bars) * barSecA > maxEnd {
                 let overflow = newStart + Double(bars) * barSecA - maxEnd
                 newStart = max(0.0, newStart - ceil(overflow / barSecA) * barSecA)
             }
-            let newEnd = newStart + Double(bars) * barSecA
+            let newEnd = min(maxEnd, newStart + Double(bars) * barSecA)
 
             let barsChanged = plan.mix.bars != bars
             let startMoved = abs(newStart - plan.trackA.mixStartSec) > 0.001
@@ -1199,7 +1454,15 @@ final class AudioPlayerManager {
             return
         }
 
-        let barsOverride = automixDurationChoice == .auto ? nil : automixDurationChoice.rawValue
+        let pairOverride = transitionAudit?.override(from: songA.id, to: songB.id)
+        let appliedOverride = pairOverride?.hasParameterCustomizations ?? false
+        let barsOverride: Int? = {
+            if let pairOverride, pairOverride.durationChoice != .auto {
+                return pairOverride.durationChoice.rawValue
+            }
+            return automixDurationChoice == .auto ? nil : automixDurationChoice.rawValue
+        }()
+        let durA = duration > 0 ? duration : Double(songA.duration ?? 180)
 
         // Busca TransitionPlan calculado pelo servidor allin1 (ou monta localmente se servidor estiver offline/ocupado)
         let rawPlan: TransitionPlan
@@ -1210,7 +1473,6 @@ final class AudioPlayerManager {
                 _ = await analysisStore?.ensureAnalyzed(songId: songA.id, localURL: localA)
             }
             _ = await analysisStore?.ensureAnalyzed(songId: songB.id, localURL: localB)
-            let durA = duration > 0 ? duration : Double(songA.duration ?? 180)
             rawPlan = SmartShuffler.buildLocalTransitionPlan(
                 idA: songA.id,
                 metaA: analysisStore?.metadata(for: songA.id),
@@ -1220,7 +1482,12 @@ final class AudioPlayerManager {
             )
         }
 
-        var plan = applyUserAutomixOverrides(to: rawPlan)
+        var plan = applyUserAutomixOverrides(
+            to: rawPlan,
+            pairOverride: pairOverride,
+            durationA: durA,
+            durationB: Double(songB.duration ?? 0)
+        )
 
         // Plano local (offline): confere o BPM real no PCM das duas faixas, porque a análise local é aproximada.
         // Planos do servidor já trazem o BPM exato da grade constante e são executados sem alteração.
@@ -1240,10 +1507,11 @@ final class AudioPlayerManager {
         guard !Task.isCancelled, currentSong?.id == songA.id, usingEngineMode, shouldUseAutomix else { return }
         let resolvedPlan = preparedPlan ?? plan
         activeTransitionPlan = resolvedPlan
+        preparedPairContext = (from: songA, to: songB, appliedOverride: appliedOverride)
 
         let outStr = Self.formatMMSS(resolvedPlan.trackA.mixStartSec)
         let inStr = Self.formatMMSS(resolvedPlan.trackB.entrySec)
-        let tag = (resolvedPlan.source == "allin1") ? "MIX IA" : "MIX LOCAL"
+        let tag = appliedOverride ? "RECEITA" : ((resolvedPlan.source == "allin1") ? "MIX IA" : "MIX LOCAL")
         let barsTxt = resolvedPlan.mix.bars.map { "\($0)c" } ?? ""
         let volShort = AutomixVolumeCurve(rawValue: resolvedPlan.mix.volumeCurve ?? "")?.shortLabel ?? "SOBREPOR"
         let eqShort = AutomixEQStyle(rawValue: resolvedPlan.mix.eqStyle ?? "")?.shortLabel ?? "EQ CENTRAL"
@@ -1259,7 +1527,7 @@ final class AudioPlayerManager {
         }
 
         logEvent(
-            resolvedPlan.source == "allin1" ? "SERVIDOR" : "ENGINE",
+            appliedOverride ? "AUDITORIA" : (resolvedPlan.source == "allin1" ? "SERVIDOR" : "ENGINE"),
             "Plano armado: \(songA.title) → \(songB.title)",
             detail: "\(tag) (\(resolvedPlan.mix.bars ?? 8) comp.) | Saída \(outStr) [\(resolvedPlan.trackA.section ?? "inst")] → Entrada \(inStr) [\(resolvedPlan.trackB.section ?? "drop")] | Rate A: \(String(format: "%.3fx", resolvedPlan.sync.targetRateA)) • Rate B: \(String(format: "%.3fx", resolvedPlan.sync.initialRateB ?? 1.0)) | \(fxSummary)"
         )
@@ -1443,11 +1711,12 @@ final class AudioPlayerManager {
             if automixEnabled, let store = analysisStore {
                 let anchor = prioritySongs.last ?? current
                 let metadata = store.items
+                let gf = activeGenreFocus
                 let token = beginBusy("Montando a fila aleatória")
                 reorderTask?.cancel()
                 reorderTask = Task { [weak self] in
                     let result = await Task.detached(priority: .userInitiated) {
-                        Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor)
+                        Self.smartOrder(songs: [anchor] + remaining, metadata: metadata, anchor: anchor, focus: gf)
                     }.value
                     guard let self else { return }
                     self.endBusy(token)
@@ -1486,10 +1755,11 @@ final class AudioPlayerManager {
         let snapshotCount = queue.count
         let snapshotIndex = currentIndex
         let reportFrom = currentIndex
+        let gf = activeGenreFocus
         reorderTask?.cancel()
         reorderTask = Task { [weak self] in
             let result = await Task.detached(priority: .utility) { () -> (queue: [Song], report: SmartShuffleRunLog) in
-                let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + tail, metadata: metadata, startingWith: anchor).dropFirst()
+                let smartTail = SmartShuffler.smartShuffle(songs: [anchor] + tail, metadata: metadata, startingWith: anchor, genreFocus: gf).dropFirst()
                 let full = keptPrefix + Array(smartTail)
                 return (full, SmartShuffler.buildShuffleReport(orderedSongs: Array(full[reportFrom..<full.count]), metadata: metadata))
             }.value
@@ -1909,5 +2179,24 @@ final class AudioPlayerManager {
             let art = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
             updateNowPlayingInfo(artwork: art)
         }
+    }
+}
+
+
+/// Lembra como o usuário costuma montar o Mix DJ (focar, só gênero ou variar) para sugerir a opção mais usada.
+enum MixFocusPreference {
+    private static let key = "mix_focus_counts.v1"
+
+    static func record(_ mode: SmartShuffler.MixFocus) {
+        var counts = UserDefaults.standard.dictionary(forKey: key) as? [String: Int] ?? [:]
+        counts[mode.rawValue, default: 0] += 1
+        UserDefaults.standard.set(counts, forKey: key)
+    }
+
+    /// Escolha mais frequente (nil enquanto não há histórico).
+    static var preferred: SmartShuffler.MixFocus? {
+        let counts = UserDefaults.standard.dictionary(forKey: key) as? [String: Int] ?? [:]
+        guard let best = counts.max(by: { $0.value < $1.value }) else { return nil }
+        return SmartShuffler.MixFocus(rawValue: best.key)
     }
 }

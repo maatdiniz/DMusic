@@ -74,6 +74,22 @@ struct AlbumDetailView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+
+                        if !songs.isEmpty {
+                            Button {
+                                player.presentGenrePicker(title: current.displayName, songs: songs, albumId: albumId)
+                            } label: {
+                                let labels = GenreTaxonomy.familyLabels(for: songs)
+                                HStack(spacing: 4) {
+                                    Image(systemName: "tag").font(.caption2)
+                                    Text(labels.isEmpty ? "Definir gênero" : labels.joined(separator: " • "))
+                                        .font(.caption).lineLimit(1)
+                                    Image(systemName: "chevron.right").font(.caption2.weight(.bold))
+                                }
+                                .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
@@ -135,6 +151,9 @@ struct AlbumDetailView: View {
                             ActionMenuItem(title: "Tocar a seguir", systemImage: "text.insert") { for s in all.reversed() { player.playNext(s) } },
                             ActionMenuItem(title: "Adicionar à fila", systemImage: "text.append") { for s in all { player.addToQueue(s) } },
                             ActionMenuItem(title: "Adicionar à playlist", systemImage: "music.note.list") { player.presentPlaylistPicker(for: all) },
+                            ActionMenuItem(title: "Gêneros do álbum", subtitle: "Ajustar para o Automix", systemImage: "tag") {
+                                player.presentGenrePicker(title: current.displayName, songs: all, albumId: albumId)
+                            },
                         ]]
                     )
                 } label: { Image(systemName: "ellipsis.circle") }

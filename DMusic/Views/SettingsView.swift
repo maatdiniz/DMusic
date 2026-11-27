@@ -202,8 +202,10 @@ struct SettingsView: View {
     @Environment(AuthViewModel.self) private var auth
     @Environment(ScrobbleManager.self) private var scrobbler
     @Environment(TrackAnalysisStore.self) private var analysisStore
+    @Environment(TransitionAuditStore.self) private var transitionAudit
     @Environment(\.dismiss) private var dismiss
     @State private var coverUsage: Int64 = 0
+    @State private var showMixWarning = false
 
     var body: some View {
         @Bindable var settings = settings
@@ -235,6 +237,37 @@ struct SettingsView: View {
                             DarkToggleRow(title: "Automix (BPM + Tom Camelot)", isOn: $player.automixEnabled)
                             DarkCardDivider()
                             DarkToggleRow(title: "Retomar de onde parou", isOn: $settings.resumePlayback)
+                            DarkCardDivider()
+                            DarkToggleRow(title: "Tocar junto com outros apps", isOn: Binding(
+                                get: { player.mixWithOtherApps },
+                                set: { on in
+                                    // Ligar exige confirmação: o iOS pode tirar os controles da tela de bloqueio
+                                    if on { showMixWarning = true } else { player.mixWithOtherApps = false }
+                                }
+                            ))
+                        }
+
+                        DarkCardSection(
+                            "Auditoria de Transições",
+                            footer: "Inspecione cada mixagem executada, julgue os parâmetros aplicados e salve sua receita personalizada para que o par (A → B) toque exatamente como você prefere na próxima vez."
+                        ) {
+                            DarkNavRow(
+                                title: "Auditar Transições e Receitas",
+                                icon: "waveform.badge.magnifyingglass",
+                                value: transitionAudit.history.isEmpty ? nil : "\(transitionAudit.history.count)"
+                            ) {
+                                TransitionAuditView()
+                            }
+                            DarkCardDivider()
+                            DarkLabeledRow(
+                                title: "Transições registradas",
+                                value: "\(transitionAudit.history.count)"
+                            )
+                            DarkCardDivider()
+                            DarkLabeledRow(
+                                title: "Receitas personalizadas",
+                                value: "\(transitionAudit.overrides.count)"
+                            )
                         }
 
                         DarkCardSection(
@@ -380,6 +413,12 @@ struct SettingsView: View {
             .onChange(of: settings.recentLimitMB) { _, _ in recents.trim(protecting: playingIds) }
         }
         .preferredColorScheme(.dark)
+        .alert("Tocar junto com outros apps", isPresented: $showMixWarning) {
+            Button("Cancelar", role: .cancel) {}
+            Button("Ativar") { player.mixWithOtherApps = true }
+        } message: {
+            Text("Com esta opção o DMusic continua tocando enquanto você usa outros apps, sem pausar. Em troca, o iOS pode deixar de mostrar os controles do DMusic (play, pausa e próxima) na tela de bloqueio e na Central de Controle. Se isso acontecer, desligue a opção para tê-los de volta.")
+        }
     }
 
     private func actionRow(_ title: String, destructive: Bool = false, action: @escaping () -> Void) -> some View {

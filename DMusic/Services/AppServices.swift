@@ -14,6 +14,7 @@ final class AppServices {
     let scrobbler = ScrobbleManager()
     let favorites = FavoritesStore()
     let analysisStore = TrackAnalysisStore()
+    let transitionAudit = TransitionAuditStore()
 
     private var wiredServerURL: String?
     private var didWireOnce = false
@@ -42,6 +43,7 @@ final class AppServices {
         player.settings = cacheSettings
         player.applyVolumeCompensation(cacheSettings.volumeCompensation)
         player.analysisStore = analysisStore
+        player.transitionAudit = transitionAudit
         downloads.analysisStore = analysisStore
         recents.analysisStore = analysisStore
         downloads.analyzeExistingFiles()

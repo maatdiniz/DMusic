@@ -15,6 +15,7 @@ struct DMusicApp: App {
     @State private var scrobbler = AppServices.shared.scrobbler
     @State private var favorites = AppServices.shared.favorites
     @State private var analysisStore = AppServices.shared.analysisStore
+    @State private var transitionAudit = AppServices.shared.transitionAudit
 
     var body: some Scene {
         WindowGroup {
@@ -28,6 +29,7 @@ struct DMusicApp: App {
                 .environment(scrobbler)
                 .environment(favorites)
                 .environment(analysisStore)
+                .environment(transitionAudit)
                 .tint(Color(red: 0.04, green: 0.52, blue: 1.0))
         }
     }

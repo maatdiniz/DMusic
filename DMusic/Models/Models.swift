@@ -5,6 +5,10 @@ nonisolated struct SongArtistRef: Codable, Hashable, Sendable {
     let name: String
 }
 
+nonisolated struct SongGenreRef: Codable, Hashable, Sendable {
+    let name: String
+}
+
 nonisolated struct Song: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let title: String
@@ -21,6 +25,10 @@ nonisolated struct Song: Codable, Identifiable, Hashable, Sendable {
     var discNumber: Int?
     var year: Int?
     var genre: String?
+    /// OpenSubsonic: "explicit", "clean" ou vazio (vem da tag de conteúdo explícito do arquivo).
+    var explicitStatus: String?
+    /// Lista de gêneros (OpenSubsonic); `genre` traz só o primeiro/concatenado.
+    var genres: [SongGenreRef]?
     var path: String?
     var musicBrainzId: String?
     var suffix: String?
@@ -38,6 +46,8 @@ nonisolated struct Song: Codable, Identifiable, Hashable, Sendable {
         if let bitRate, bitRate > 0 { return "\(format) \(bitRate) kbps" }
         return format
     }
+
+    var isExplicit: Bool { explicitStatus?.lowercased() == "explicit" }
 
     var isHiRes: Bool { (bitDepth ?? 0) > 16 || (samplingRate ?? 0) > 44100 }
 
@@ -77,6 +87,13 @@ nonisolated struct Playlist: Codable, Identifiable, Hashable, Sendable {
     var entry: [Song]?
 }
 
+/// Gênero cru do Navidrome (`getGenres`) com contagens.
+nonisolated struct GenreInfo: Decodable, Hashable, Sendable {
+    let value: String
+    let songCount: Int?
+    let albumCount: Int?
+}
+
 nonisolated struct SubsonicResponse: Decodable, Sendable {
     struct APIError: Decodable, Sendable { let code: Int?; let message: String? }
     struct AlbumList: Decodable, Sendable { let album: [Album]? }
@@ -84,6 +101,7 @@ nonisolated struct SubsonicResponse: Decodable, Sendable {
     struct Artists: Decodable, Sendable { let index: [ArtistIndex]? }
     struct Playlists: Decodable, Sendable { let playlist: [Playlist]? }
     struct SongList: Decodable, Sendable { let song: [Song]? }
+    struct Genres: Decodable, Sendable { let genre: [GenreInfo]? }
     struct SearchResult: Decodable, Sendable {
         let artist: [Artist]?
         let album: [Album]?
@@ -102,6 +120,7 @@ nonisolated struct SubsonicResponse: Decodable, Sendable {
         let searchResult3: SearchResult?
         let starred2: SearchResult?
         let randomSongs: SongList?
+        let genres: Genres?
     }
     let body: Body
     enum CodingKeys: String, CodingKey { case body = "subsonic-response" }
