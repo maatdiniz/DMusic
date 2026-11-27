@@ -37,7 +37,20 @@ from typing import Dict, List, Optional, Tuple
 import unicodedata
 
 # postprocess.py fica ao lado deste script (também nos workers "spawn")
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+
+# Se o script foi chamado pelo Python global (ex.: botão Run do editor usando /usr/local/bin/python3),
+# relança automaticamente dentro da .venv local para encontrar demucs, torch, allin1 e librosa.
+if __name__ == "__main__":
+    _VENV_PY = _SCRIPT_DIR / ".venv" / "bin" / "python3"
+    if _VENV_PY.is_file() and Path(sys.executable).resolve() != _VENV_PY.resolve():
+        print(
+            f"[INFO] Python global detectado ({sys.executable}). "
+            f"Redirecionando automaticamente para o ambiente virtual ({_VENV_PY})...",
+            flush=True,
+        )
+        os.execv(str(_VENV_PY), [str(_VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 AUDIO_EXTS = {
     ".flac", ".mp3", ".m4a", ".aiff", ".aif", ".wav", ".ogg", ".opus", ".aac", ".alac", ".wv"
@@ -564,7 +577,10 @@ def analyze_cpu_task(job: Tuple[str, str, str, str, str, str, float, str]) -> di
 
     raw = {"bpm": bpm, "beats": beats, "downbeats": downbeats, "segments": segments}
     stats_dir = Path(json_path_str).parent.parent
+    fallback_stats_dir = Path.home() / "Soulseek Downloads" / "complete" / "_diniz_mix"
     energy_stats_path = stats_dir / "energy_stats.json"
+    if not energy_stats_path.is_file() and (fallback_stats_dir / "energy_stats.json").is_file():
+        energy_stats_path = fallback_stats_dir / "energy_stats.json"
     energy_stats = json.loads(energy_stats_path.read_text(encoding="utf-8")) if energy_stats_path.is_file() else None
     final = finalize_analysis(file_path, raw, duration, y, sr, vocal_env=vocal_env, energy_stats=energy_stats)
     if "energy" not in final:
@@ -573,7 +589,9 @@ def analyze_cpu_task(job: Tuple[str, str, str, str, str, str, float, str]) -> di
     vibe_vec: List[float] = []
     try:
         raw_vibe = extract_raw_vibe_features(file_path, duration=duration)
-        stats_path = Path(json_path_str).parent.parent / "vibe_stats.json"
+        stats_path = stats_dir / "vibe_stats.json"
+        if not stats_path.is_file() and (fallback_stats_dir / "vibe_stats.json").is_file():
+            stats_path = fallback_stats_dir / "vibe_stats.json"
         vibe_stats = json.loads(stats_path.read_text(encoding="utf-8")) if stats_path.is_file() else None
         vibe_vec = standardize_vibe(raw_vibe, vibe_stats)
     except Exception:
@@ -823,10 +841,166 @@ def collect_audio_files(music_dir: Path) -> List[Tuple[Path, str]]:
     return found
 
 
-def sync_existing_to_server(tracks_dir: Path, server_url: str) -> None:
+# Faixas do Apple Music que já existem no Soulseek em outro formato/container ou são arquivos de teste
+ITUNES_IGNORE_RELS = {
+    "VTSS/Can't Catch Me - Single/01 Can't Catch Me.m4a",
+    "Unknown Artist/Unknown Album/1_atual_servidor.wav",
+}
+
+
+def collect_itunes_files(
+    itunes_dir: Path,
+    soulseek_files: List[Tuple[Path, str]],
+) -> Tuple[List[Tuple[Path, str, str]], int]:
+    """Vasculha a biblioteca do Apple Music (`itunes_dir`), ignorando duplicatas que já estão no Soulseek
+    (por tamanho exato em bytes ou na lista `ITUNES_IGNORE_RELS`).
+    Retorna `(lista_de_(full_path, server_rel_nfc, itunes_rel), total_duplicatas_suprimidas)`."""
+    if not itunes_dir.is_dir():
+        return [], 0
+
+    soulseek_sizes = set()
+    for full, _ in soulseek_files:
+        try:
+            soulseek_sizes.add(full.stat().st_size)
+        except OSError:
+            pass
+
+    found: List[Tuple[Path, str, str]] = []
+    suppressed = 0
+    for root, dirs, files in os.walk(itunes_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for fname in sorted(files):
+            if fname.startswith("."):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in AUDIO_EXTS:
+                continue
+            full = Path(root) / fname
+            itunes_rel = norm_rel(str(full.relative_to(itunes_dir)))
+            if itunes_rel in ITUNES_IGNORE_RELS or itunes_rel.startswith("Unknown Artist/Unknown Album/"):
+                suppressed += 1
+                continue
+            try:
+                sz = full.stat().st_size
+            except OSError:
+                continue
+            if sz in soulseek_sizes:
+                suppressed += 1
+                continue
+            server_rel_nfc = f"iTunes/{itunes_rel}"
+            found.append((full, server_rel_nfc, itunes_rel))
+    return found, suppressed
+
+
+def _get_ssh_password() -> Optional[str]:
+    """Lê a senha SSH de DMUSIC_SSH_PASS ou do Keychain do macOS (`dmusic.ssh.server`), sem expor credenciais no Git."""
+    import subprocess
+
+    env_pass = os.environ.get("DMUSIC_SSH_PASS")
+    if env_pass:
+        return env_pass
+    try:
+        res = subprocess.run(
+            ["security", "find-generic-password", "-a", "matheus", "-s", "dmusic.ssh.server", "-w"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _run_ssh_tar(tar_bytes: bytes, remote_dest: str, ssh_host: str = "matheus@100.125.12.71") -> bool:
+    """Envia um stream tar via SSH para `remote_dest` no servidor."""
+    import pty
+    import select
+    import tempfile
+
+    ssh_pass = _get_ssh_password()
+    with tempfile.NamedTemporaryFile(prefix="dmusic_sync_", suffix=".tar", delete=False) as tf:
+        tmp_tar = Path(tf.name)
+        tf.write(tar_bytes)
+    try:
+        cmd = f"ssh -o StrictHostKeyChecking=no {ssh_host} 'mkdir -p \"{remote_dest}\" && tar -xf - -C \"{remote_dest}\"' < '{tmp_tar}'"
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp("zsh", ["zsh", "-c", cmd])
+        out = b""
+        sent = False
+        while True:
+            r, _, _ = select.select([fd], [], [], 120)
+            if not r:
+                break
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if not sent and b"password:" in out.lower() and ssh_pass:
+                os.write(fd, (ssh_pass + "\n").encode("utf-8"))
+                sent = True
+        _, status = os.waitpid(pid, 0)
+        return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    finally:
+        tmp_tar.unlink(missing_ok=True)
+
+
+def upload_itunes_audio_batch(items: List[Tuple[str, str]]) -> bool:
+    """Empacota e envia arquivos de áudio novos do Apple Music `(local_path, itunes_rel)`
+    para `/home/matheus/arquivos_mac/iTunes` no servidor via SSH."""
+    import io
+    import tarfile
+
+    if not items:
+        return True
+    print(f"Enviando {len(items)} áudio(s) novo(s) do Apple Music para o servidor (/home/matheus/arquivos_mac/iTunes)...", flush=True)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for local_path, itunes_rel in items:
+            if Path(local_path).is_file():
+                tf.add(local_path, arcname=itunes_rel, recursive=False)
+    ok = _run_ssh_tar(buf.getvalue(), "/home/matheus/arquivos_mac/iTunes")
+    if ok:
+        print(f"  Upload concluído ({len(items)} faixa(s) enviadas ao Navidrome).", flush=True)
+    else:
+        print("  AVISO: falha no upload SSH dos áudios do Apple Music.", flush=True)
+    return ok
+
+
+def upload_itunes_jsons_and_scan(json_paths: List[str], server_url: str) -> None:
+    """Copia os JSONs analisados do Apple Music para `/home/matheus/arquivos_mac/SoulSeek/_diniz_mix/tracks`
+    no servidor e dispara `POST /api/scan`."""
+    import io
+    import requests
+    import tarfile
+
+    valid = [Path(p) for p in json_paths if Path(p).is_file()]
+    if valid:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for jp in valid:
+                tf.add(str(jp), arcname=jp.name, recursive=False)
+        _run_ssh_tar(buf.getvalue(), "/home/matheus/arquivos_mac/SoulSeek/_diniz_mix/tracks")
+
+    if server_url:
+        try:
+            r = requests.post(f"{server_url.rstrip('/')}/api/scan", timeout=25)
+            print(f"Scan no servidor ({server_url}/api/scan): {r.status_code} {r.text}", flush=True)
+        except Exception as exc:
+            print(f"AVISO: falha ao acionar /api/scan: {exc}", flush=True)
+
+
+def sync_existing_to_server(tracks_dir: Path, server_url: str, itunes_tracks_dir: Optional[Path] = None) -> None:
     import requests
 
     jsons = sorted(tracks_dir.glob("*.json"))
+    if itunes_tracks_dir and itunes_tracks_dir.is_dir():
+        jsons.extend(sorted(itunes_tracks_dir.glob("*.json")))
     print(f"Sincronizando {len(jsons)} arquivos existentes com {server_url}...", flush=True)
     ok = 0
     for idx, jp in enumerate(jsons, 1):
@@ -839,6 +1013,10 @@ def sync_existing_to_server(tracks_dir: Path, server_url: str) -> None:
             pass
         if idx % 50 == 0 or idx == len(jsons):
             print(f"  [{idx}/{len(jsons)}] sincronizados ({ok} OK)", flush=True)
+    try:
+        requests.post(f"{server_url.rstrip('/')}/api/scan", timeout=25)
+    except Exception:
+        pass
 
 
 def _handle_completed(fut: Future, rel_path: str, done_count: int, total_count: int) -> bool:
@@ -868,6 +1046,8 @@ def main() -> None:
     parser.add_argument("--sync-only", action="store_true")
     parser.add_argument("--backfill-vibe", action="store_true", help="Extrai vetor vibe/timbre 24D para toda biblioteca já analisada")
     parser.add_argument("--itunes-dir", default=os.path.expanduser("~/Music/Music/Media.localized/Music"))
+    parser.add_argument("--no-itunes", action="store_true", help="Ignora a pasta do Apple Music (analisa só Soulseek)")
+    parser.add_argument("--no-itunes-upload", action="store_true", help="Não envia áudios novos do Apple Music via SSH ao servidor")
     parser.add_argument("--reprocess", action="store_true", help="Refaz só o pós-processamento (grade, tom, energia...) de todos os JSONs")
     parser.add_argument("--out-dir", default="", help="Com --reprocess: grava em outra pasta (ensaio), sem alterar JSONs nem servidor")
     parser.add_argument("--vocals-backfill", action="store_true", help="Roda o demucs nas faixas sem envelope de voz (bar_vocal)")
@@ -920,12 +1100,13 @@ def main() -> None:
 
     if args.sync_only:
         if args.server_url:
-            sync_existing_to_server(tracks_dir, args.server_url)
+            sync_existing_to_server(tracks_dir, args.server_url, itunes_tracks if itunes_tracks.is_dir() else None)
         return
 
     all_files = collect_audio_files(music_dir)
     pending: List[Tuple[str, str, str, str]] = []
-    skipped = 0
+    skipped_ss = 0
+    pending_ss = 0
 
     for full, rel_nfc in all_files:
         t_hash = track_hash(rel_nfc)
@@ -935,14 +1116,45 @@ def main() -> None:
                 existing = json.loads(jp.read_text(encoding="utf-8"))
                 st = full.stat()
                 if existing.get("size") == st.st_size and abs(float(existing.get("mtime", 0)) - st.st_mtime) < 2.0:
-                    skipped += 1
+                    skipped_ss += 1
                     continue
             except Exception:
                 pass
         pending.append((str(full), rel_nfc, str(jp), args.server_url))
+        pending_ss += 1
+
+    # Também vasculha a pasta do Apple Music (deduplicando contra o Soulseek)
+    itunes_files: List[Tuple[Path, str, str]] = []
+    itunes_suppressed = 0
+    skipped_it = 0
+    pending_itunes_uploads: List[Tuple[str, str]] = []
+    pending_itunes_jsons: List[str] = []
+
+    if not args.no_itunes and itunes_music.is_dir():
+        itunes_tracks.mkdir(parents=True, exist_ok=True)
+        itunes_files, itunes_suppressed = collect_itunes_files(itunes_music, all_files)
+        for full, server_rel_nfc, itunes_rel in itunes_files:
+            t_hash = track_hash(server_rel_nfc)
+            jp = itunes_tracks / f"{t_hash}.json"
+            if not args.force and jp.exists():
+                try:
+                    existing = json.loads(jp.read_text(encoding="utf-8"))
+                    st = full.stat()
+                    if existing.get("size") == st.st_size and abs(float(existing.get("mtime", 0)) - st.st_mtime) < 2.0:
+                        skipped_it += 1
+                        continue
+                except Exception:
+                    pass
+            pending.append((str(full), server_rel_nfc, str(jp), args.server_url))
+            pending_itunes_uploads.append((str(full), itunes_rel))
+            pending_itunes_jsons.append(str(jp))
 
     if args.limit > 0:
         pending = pending[:args.limit]
+        allowed_full = {item[0] for item in pending}
+        pending_itunes_uploads = [u for u in pending_itunes_uploads if u[0] in allowed_full]
+        allowed_jp = {item[2] for item in pending}
+        pending_itunes_jsons = [j for j in pending_itunes_jsons if j in allowed_jp]
 
     cpu_count = os.cpu_count() or 10
     cpu_workers = max(1, args.workers)
@@ -956,13 +1168,26 @@ def main() -> None:
         chosen_demix = "mps" if torch.backends.mps.is_available() else "cpu"
 
     print(
-        f"Biblioteca: {len(all_files)} faixas | Já analisadas: {skipped} | Pendentes: {len(pending)} | "
-        f"Pipeline: 1 Produtor Demix ({chosen_demix}) -> {cpu_workers} Consumidores CPU ({cpu_threads} threads/worker) | Modelo: {args.model}",
+        f"Soulseek: {len(all_files)} faixas ({skipped_ss} ok, {pending_ss} pendentes) | "
+        f"Apple Music: {len(itunes_files)} inéditas, {itunes_suppressed} dup. ignoradas ({skipped_it} ok, {len(pending_itunes_uploads)} pendentes)\n"
+        f"Total Pendentes: {len(pending)} | Pipeline: 1 Produtor Demix ({chosen_demix}) -> {cpu_workers} Consumidores CPU ({cpu_threads} threads/worker) | Modelo: {args.model}",
         flush=True,
     )
     if not pending:
         print("Nenhuma música nova para analisar!", flush=True)
         return
+
+    # Envia os áudios novos do Apple Music antes da análise para que o Navidrome já indexe no servidor enquanto a GPU analisa
+    if pending_itunes_uploads and not args.no_itunes_upload:
+        upload_itunes_audio_batch(pending_itunes_uploads)
+
+    print(
+        "\n[AVISO SOBRE MENSAGENS DAS BIBLIOTECAS — NENHUMA ETAPA É PERDIDA]:\n"
+        "  • 'Warning: unauthenticated requests to the HF Hub': apenas verifica o cache público do modelo harmonix-fold0.\n"
+        "  • 'PySoundFile failed. Trying audioread instead': esperado em arquivos .m4a (Apple Music)! O PySoundFile só lê FLAC/WAV/MP3\n"
+        "    e repassa a leitura automaticamente para o CoreAudio/ffmpeg do macOS, analisando 100% da faixa normalmente.\n",
+        flush=True,
+    )
 
     sep = demucs.api.Separator(model="htdemucs", device=chosen_demix, progress=False)
     cpu_sep = None
@@ -1051,6 +1276,11 @@ def main() -> None:
             done += 1
             if not _handle_completed(f_done, r_path, done, len(pending)):
                 errors += 1
+
+    if pending_itunes_jsons and not args.no_itunes_upload:
+        upload_itunes_jsons_and_scan(pending_itunes_jsons, args.server_url)
+    elif args.server_url and (done - errors) > 0:
+        upload_itunes_jsons_and_scan([], args.server_url)
 
     print(
         f"Concluído: {done - errors}/{len(pending)} ok, {errors} erros em {time.time() - t_all:.1f}s",
